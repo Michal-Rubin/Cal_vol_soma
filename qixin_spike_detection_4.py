@@ -588,7 +588,7 @@ def detect_bursts_from_vm(trace_idx, spike_heights_interpolated, complex_bursts_
     Vm_finite = np.where(np.isfinite(Vm), Vm, 0.0)
 
     # Detect positive regions (Vm > 0)
-    above = Vm_finite > 0
+    above = Vm_finite > 0.15  # threshold to avoid noise-induced small blips; can be tuned or made a parameter
     diff = np.diff(above.astype(np.int8))
     rise_idx = np.where(diff == 1)[0] + 1   # frame where Vm goes above 0
     fall_idx = np.where(diff == -1)[0] + 1   # frame where Vm goes below 0
@@ -640,7 +640,7 @@ def detect_bursts_from_vm(trace_idx, spike_heights_interpolated, complex_bursts_
         baseline = _local_baseline(win_start)
         peak_amp = peak_raw - baseline if baseline_subtract else peak_raw
         duration_ms = (win_end - win_start + 1) * 1000 / fr
-        auc = np.trapz(np.clip(window, 0, None), dx=1 / fr) if len(window) > 0 else 0.0
+        auc = np.trapezoid(np.clip(window, 0, None), dx=1 / fr) if len(window) > 0 else 0.0
 
         n_spikes = len(spikes_in_window)
         meets_criteria = n_spikes >= min_num_spikes and peak_amp >= cb_amp_threshold and duration_ms >= cb_duration_threshold
@@ -770,7 +770,7 @@ def detect_bursts_from_vm(trace_idx, spike_heights_interpolated, complex_bursts_
             baseline = _local_baseline(s)
             peak_amp = peak_raw - baseline if baseline_subtract else peak_raw
             duration_ms = (e - s + 1) * 1000 / fr
-            auc = np.trapz(np.clip(window, 0, None), dx=1 / fr) if len(window) > 0 else 0.0
+            auc = np.trapezoid(np.clip(window, 0, None), dx=1 / fr) if len(window) > 0 else 0.0
             burst_metrics.append({
                 'start': s,
                 'end': e,
@@ -827,6 +827,915 @@ def detect_bursts_from_vm(trace_idx, spike_heights_interpolated, complex_bursts_
     }
 
     return simple_spikes_all, complex_spikes, all_spikes, trace_snr_interpolated_unfiltered, Vm_unfiltered, burst_metrics, complex_bursts_dict_vm
+
+
+def detect_bursts_from_vm_platue(trace_idx, spike_heights_interpolated, complex_bursts_dict, all_spikes, fr,
+                          highpass=1.0, median_window=11, cb_amp_threshold=0.3, cb_duration_threshold=20,
+                          isi_threshold_ms=20, baseline_subtract=False, baseline_window_ms=20,
+                          baseline_percentile=10, min_num_spikes=2,
+                          vm_crossing_threshold=0.1,
+                          merge_SS_ms=None, merge_CB_ms=None,
+                          plateau_duration_threshold=100, plateau_amp_threshold=0.5,
+                          plateau_kernel_ms=100, plateau_score_min_ms=20,
+                          plotflag=True, pdf=None, segment_duration=10, rows_per_page=30):
+    """
+    Detect bursts from subthreshold Vm and compute burst metrics.
+
+    Returns:
+        simple_spikes_all, complex_spikes, all_spikes, trace_SNR_interpolated, Vm, burst_metrics, complex_bursts_dict_vm, plateaus_dict
+    """
+    trace_idx = np.asarray(trace_idx, dtype=float)
+    spike_heights_interpolated = np.asarray(spike_heights_interpolated, dtype=float)
+    all_spikes = np.asarray(all_spikes, dtype=np.int64)
+    n = len(trace_idx)
+
+    if n == 0:
+        empty_dict = {
+            'complex_bursts': np.array([], dtype=np.int64),
+            'starts': np.array([], dtype=np.int64),
+            'ends': np.array([], dtype=np.int64),
+            'durations_ms': np.array([], dtype=np.int64),
+            'amplitudes': np.array([], dtype=float),
+            'baselines': np.array([], dtype=float),
+            'locs': np.array([], dtype=np.int64),
+            'peaks': np.array([], dtype=float),
+            'trace_mf': np.array([], dtype=float),
+        }
+        empty_plateaus = {
+            'starts': np.array([], dtype=np.int64),
+            'ends': np.array([], dtype=np.int64),
+            'durations_ms': np.array([], dtype=float),
+            'amplitudes': np.array([], dtype=float),
+            'baselines': np.array([], dtype=float),
+            'locs': np.array([], dtype=np.int64),
+            'peaks': np.array([], dtype=float),
+            'n_spikes': np.array([], dtype=np.int64),
+            'spike_indices': [],
+        }
+        return np.array([], dtype=np.int64), np.array([], dtype=np.int64), all_spikes, np.array([]), np.array([]), [], empty_dict, empty_plateaus
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        trace_snr_interpolated = trace_idx / spike_heights_interpolated
+    trace_snr_interpolated_unfiltered = trace_snr_interpolated.copy()
+    Vm_unfiltered = get_subthreshold_activity(trace_snr_interpolated_unfiltered, all_spikes, median_window=median_window)
+
+    trace_snr_interpolated[~np.isfinite(trace_snr_interpolated)] = np.nan
+    trace_snr_interpolated = interpolate_nan_segment(trace_snr_interpolated)
+
+    # Estimate slow baseline from the noCS trace (events blanked) to avoid
+    # high-pass filter ringing artifacts before sharp events.
+    trace_snr_interpolated_noCS = trace_snr_interpolated.copy()
+    for start, end in zip(complex_bursts_dict['starts'], complex_bursts_dict['ends']):
+        trace_snr_interpolated_noCS[start:end + 1] = np.nan
+    trace_snr_interpolated_noCS = interpolate_nan_segment(trace_snr_interpolated_noCS)
+
+    if highpass and highpass > 0:
+        hp_median_window = int(np.round(fr / highpass))
+        hp_median_window = hp_median_window + 1 if hp_median_window % 2 == 0 else hp_median_window  # must be odd
+        slow_baseline = median_filter(trace_snr_interpolated_noCS, size=hp_median_window)
+        trace_snr_interpolated = trace_snr_interpolated - slow_baseline
+
+    Vm = get_subthreshold_activity(trace_snr_interpolated, all_spikes, median_window=median_window)
+    _ = get_subthreshold_activity(trace_snr_interpolated_noCS, all_spikes, median_window=median_window)
+
+    # Subtract global median so that zero-crossings reflect deviations from the median
+    # vm_median = np.nanmedian(Vm)
+    # Vm = Vm - vm_median
+    # trace_snr_interpolated = trace_snr_interpolated - vm_median
+
+    baseline_window_frames = int(np.round(baseline_window_ms * fr / 1000))
+    baseline_window_frames = max(1, baseline_window_frames)
+
+    def _local_baseline(start_idx):
+        if not baseline_subtract:
+            return 0.0
+        base_start = max(0, int(start_idx) - baseline_window_frames)
+        base_end = max(0, int(start_idx))
+        region = Vm[base_start:base_end]
+        if region.size == 0:
+            return 0.0
+        region = region[np.isfinite(region)]
+        if region.size == 0:
+            return 0.0
+        if baseline_percentile is None:
+            return float(np.nanmin(region))
+        return float(np.nanpercentile(region, baseline_percentile))
+
+    def _burst_min_isi_ms(spikes):
+        spikes = np.asarray(spikes, dtype=np.int64)
+        if spikes.size < 2:
+            return np.inf
+        isi_ms = np.diff(np.sort(spikes)) * 1000.0 / fr
+        if isi_ms.size == 0:
+            return np.inf
+        return float(np.nanmin(isi_ms))
+
+    def _passes_complex_isi(spikes):
+        spikes = np.asarray(spikes, dtype=np.int64)
+        if spikes.size < 2:
+            return False
+        if isi_threshold_ms is None:
+            return True
+        return _burst_min_isi_ms(spikes) <= float(isi_threshold_ms)
+
+    spike_times = all_spikes[(all_spikes >= 0) & (all_spikes < len(Vm))]
+    spike_times = np.sort(spike_times)
+    crossing_thr = float(vm_crossing_threshold) if vm_crossing_threshold is not None else 0.1
+
+    # -----------------------------------------------------------------
+    # Find depolarization windows from Vm zero-crossings, then collect
+    # spikes into each window.
+    # -----------------------------------------------------------------
+    Vm_finite = np.where(np.isfinite(Vm), Vm, 0.0)
+
+    # -----------------------------------------------------------------
+    # Convolution-based plateau detection (separate pass before depol loop)
+    # -----------------------------------------------------------------
+    kernel_frames = max(1, int(np.round(plateau_kernel_ms * fr / 1000)))
+    kernel = np.ones(kernel_frames) / kernel_frames
+    plateau_score = np.convolve(Vm_finite, kernel, mode='same')
+
+    # Find contiguous regions where plateau_score >= plateau_amp_threshold
+    score_above = plateau_score >= plateau_amp_threshold
+    score_diff = np.diff(score_above.astype(np.int8))
+    score_rises = np.where(score_diff == 1)[0] + 1
+    score_falls = np.where(score_diff == -1)[0] + 1
+    if score_above[0]:
+        score_rises = np.concatenate([[0], score_rises])
+    if score_above[-1]:
+        score_falls = np.concatenate([score_falls, [len(plateau_score)]])
+
+    # Pair up into candidate regions
+    pre_plateau_windows = []
+    sri = 0
+    sfi = 0
+    while sri < len(score_rises) and sfi < len(score_falls):
+        sr = score_rises[sri]
+        while sfi < len(score_falls) and score_falls[sfi] <= sr:
+            sfi += 1
+        if sfi >= len(score_falls):
+            break
+        sf = score_falls[sfi]
+        pre_plateau_windows.append((int(sr), int(sf) - 1))
+        sri += 1
+        sfi += 1
+
+    # Filter scored candidates: score must exceed threshold for at least plateau_score_min_ms
+    score_min_frames = max(1, int(np.round(plateau_score_min_ms * fr / 1000)))
+    pre_plateau_windows = [(s, e) for s, e in pre_plateau_windows if (e - s + 1) >= score_min_frames]
+
+    # Refine each candidate: expand to the full Vm > crossing threshold window
+    # (same zero-crossing boundaries as CB), then filter by duration and spikes
+    plateau_duration_frames = max(1, int(np.round(plateau_duration_threshold * fr / 1000)))
+    plateau_windows_detected = []  # (start, end) inclusive
+    for cand_s, cand_e in pre_plateau_windows:
+        # Find a point within the candidate where Vm exceeds the crossing threshold
+        mid = (cand_s + cand_e) // 2
+        if Vm_finite[mid] <= crossing_thr:
+            # Find any point above threshold in the candidate
+            vm_seg = Vm_finite[cand_s:cand_e + 1]
+            pos_indices = np.where(vm_seg > crossing_thr)[0]
+            if len(pos_indices) == 0:
+                continue
+            mid = cand_s + pos_indices[len(pos_indices) // 2]
+        # Expand left to find where Vm crosses threshold (rising edge)
+        refined_s = mid
+        while refined_s > 0 and Vm_finite[refined_s - 1] > crossing_thr:
+            refined_s -= 1
+        # Expand right to find where Vm crosses threshold (falling edge)
+        refined_e = mid
+        while refined_e < n - 1 and Vm_finite[refined_e + 1] > crossing_thr:
+            refined_e += 1
+        # Check duration
+        if (refined_e - refined_s + 1) < plateau_duration_frames:
+            continue
+        # Check at least 1 spike
+        spks_in = spike_times[(spike_times >= refined_s) & (spike_times <= refined_e)]
+        if len(spks_in) == 0:
+            continue
+        # Avoid duplicates (multiple scored candidates can fall in same depol window)
+        window = (int(refined_s), int(refined_e))
+        if window not in plateau_windows_detected:
+            plateau_windows_detected.append(window)
+
+    # Build a frame-level mask for plateau-claimed frames
+    plateau_frame_mask = np.zeros(n, dtype=bool)
+    for ps, pe in plateau_windows_detected:
+        plateau_frame_mask[ps:pe + 1] = True
+
+    # Detect depolarized regions above threshold
+    above = Vm_finite > crossing_thr
+    diff = np.diff(above.astype(np.int8))
+    rise_idx = np.where(diff == 1)[0] + 1   # frame where Vm crosses above threshold
+    fall_idx = np.where(diff == -1)[0] + 1   # frame where Vm crosses below/equal threshold
+
+    # Handle edge cases: trace starts or ends above threshold
+    if above[0]:
+        rise_idx = np.concatenate([[0], rise_idx])
+    if above[-1]:
+        fall_idx = np.concatenate([fall_idx, [len(Vm)]])
+
+    # Pair up rises and falls into depolarization windows
+    depol_windows = []
+    ri = 0
+    fi = 0
+    while ri < len(rise_idx) and fi < len(fall_idx):
+        r = rise_idx[ri]
+        # find the next fall after this rise
+        while fi < len(fall_idx) and fall_idx[fi] <= r:
+            fi += 1
+        if fi >= len(fall_idx):
+            break
+        f = fall_idx[fi]
+        depol_windows.append((int(r), int(f) - 1))  # inclusive end
+        ri += 1
+        fi += 1
+
+    complex_bursts = []
+    simple_bursts = []
+    complex_spikes = []
+    simple_burst_spikes = []
+    single_spikes = []
+    plateau_spikes = []
+    burst_metrics = []
+
+    # Track which spikes have been assigned to a depolarization window
+    assigned = np.zeros(len(spike_times), dtype=bool)
+
+    for win_start, win_end in depol_windows:
+        # Collect all spikes within this depolarization window
+        mask = (spike_times >= win_start) & (spike_times <= win_end)
+        spikes_in_window = spike_times[mask]
+
+        window = Vm_finite[win_start:win_end + 1]
+        peak_raw = np.nanmax(window) if len(window) > 0 else np.nan
+        baseline = _local_baseline(win_start)
+        peak_amp = peak_raw - baseline if baseline_subtract else peak_raw
+        duration_ms = (win_end - win_start + 1) * 1000 / fr
+        auc = np.trapz(np.clip(window, 0, None), dx=1 / fr) if len(window) > 0 else 0.0
+
+        n_spikes = len(spikes_in_window)
+        min_isi_ms = _burst_min_isi_ms(spikes_in_window)
+        # Check if this depol window overlaps a pre-detected plateau
+        in_plateau = np.any(plateau_frame_mask[win_start:win_end + 1])
+        meets_isi = _passes_complex_isi(spikes_in_window)
+        meets_cb = (not in_plateau) and n_spikes >= min_num_spikes and peak_amp >= cb_amp_threshold and duration_ms >= cb_duration_threshold and meets_isi
+
+        burst_metrics.append({
+            'start': win_start,
+            'end': win_end,
+            'n_spikes': n_spikes,
+            'peak_amp': peak_amp,
+            'baseline': baseline,
+            'duration_ms': duration_ms,
+            'auc': auc,
+            'min_isi_ms': min_isi_ms,
+            'is_complex': meets_cb,
+            'is_plateau': in_plateau,
+            'is_single': n_spikes == 1 and not in_plateau,
+        })
+
+        if n_spikes > 0:
+            assigned[mask] = True
+
+        if in_plateau:
+            # Spikes in plateau-overlapping windows go to plateau_spikes + complex_spikes
+            plateau_spikes.extend(spikes_in_window.tolist())
+            complex_spikes.extend(spikes_in_window.tolist())
+        elif meets_cb:
+            complex_bursts.append((win_start, win_end))
+            complex_spikes.extend(spikes_in_window.tolist())
+        elif n_spikes > 1:
+            simple_bursts.append((win_start, win_end))
+            simple_burst_spikes.extend(spikes_in_window.tolist())
+        elif n_spikes == 1:
+            single_spikes.append(int(spikes_in_window[0]))
+
+    # Handle spikes not in any depolarization window (Vm <= crossing threshold at spike time)
+    unassigned_spikes = spike_times[~assigned]
+    for spk in unassigned_spikes:
+        spk = int(spk)
+        single_spikes.append(spk)
+        burst_metrics.append({
+            'start': spk,
+            'end': spk,
+            'n_spikes': 1,
+            'peak_amp': float(Vm_finite[spk]) if spk < len(Vm_finite) else np.nan,
+            'baseline': _local_baseline(spk),
+            'duration_ms': 1000 / fr,
+            'auc': 0.0,
+            'is_complex': False,
+            'is_plateau': False,
+            'is_single': True,
+        })
+
+    # -----------------------------------------------------------------
+    # Post-processing: merge nearby complex bursts and absorb nearby
+    # simple spikes into complex bursts
+    # -----------------------------------------------------------------
+
+    # Step 1: merge_CB_ms — merge complex bursts within merge_CB_ms of each other
+    if merge_CB_ms is not None and len(complex_bursts) > 1:
+        merge_CB_frames = int(np.round(merge_CB_ms * fr / 1000))
+        # Build records associating spikes with their burst
+        cb_records = []
+        for (s, e) in sorted(complex_bursts, key=lambda x: x[0]):
+            spks = sorted([sp for sp in complex_spikes if s <= sp <= e])
+            cb_records.append({'start': s, 'end': e, 'spikes': spks})
+
+        merged_records = [{'start': cb_records[0]['start'], 'end': cb_records[0]['end'],
+                           'spikes': list(cb_records[0]['spikes'])}]
+        for rec in cb_records[1:]:
+            prev = merged_records[-1]
+            if rec['start'] - prev['end'] <= merge_CB_frames:
+                # Merge: extend window and combine spikes
+                prev['end'] = rec['end']
+                prev['spikes'].extend(rec['spikes'])
+                # Also absorb any simple/single spikes that fall within the merged window
+                gap_spikes = [sp for sp in single_spikes
+                              if prev['start'] <= sp <= prev['end'] and sp not in prev['spikes']]
+                gap_spikes += [sp for sp in simple_burst_spikes
+                               if prev['start'] <= sp <= prev['end'] and sp not in prev['spikes']]
+                prev['spikes'].extend(gap_spikes)
+                prev['spikes'] = sorted(set(prev['spikes']))
+                absorbed = set(gap_spikes)
+                single_spikes = [sp for sp in single_spikes if sp not in absorbed]
+                simple_burst_spikes = [sp for sp in simple_burst_spikes if sp not in absorbed]
+            else:
+                merged_records.append({'start': rec['start'], 'end': rec['end'],
+                                       'spikes': list(rec['spikes'])})
+
+        # Rebuild complex_bursts and complex_spikes from merged records
+        complex_bursts = [(r['start'], r['end']) for r in merged_records]
+        complex_spikes = []
+        for r in merged_records:
+            complex_spikes.extend(r['spikes'])
+
+    # Step 2: merge_SS_ms — absorb simple spikes near the start of each complex burst
+    if merge_SS_ms is not None and len(complex_bursts) > 0:
+        merge_SS_frames = int(np.round(merge_SS_ms * fr / 1000))
+        all_simple = sorted(set(single_spikes + simple_burst_spikes))
+        absorbed = set()
+
+        # Build records from current complex_bursts
+        cs_set = set(complex_spikes)
+        cb_records = []
+        for (s, e) in sorted(complex_bursts, key=lambda x: x[0]):
+            spks = sorted([sp for sp in cs_set if s <= sp <= e])
+            cb_records.append({'start': s, 'end': e, 'spikes': spks})
+
+        for rec in cb_records:
+            first_spike = min(rec['spikes'])
+            # Find simple spikes within merge_SS_frames before the first spike
+            for sp in all_simple:
+                if sp not in absorbed and first_spike - merge_SS_frames <= sp < first_spike:
+                    rec['spikes'].append(sp)
+                    rec['start'] = min(rec['start'], sp)
+                    absorbed.add(sp)
+            rec['spikes'].sort()
+
+        # Rebuild
+        complex_bursts = [(r['start'], r['end']) for r in cb_records]
+        complex_spikes = []
+        for r in cb_records:
+            complex_spikes.extend(r['spikes'])
+        single_spikes = [sp for sp in single_spikes if sp not in absorbed]
+        simple_burst_spikes = [sp for sp in simple_burst_spikes if sp not in absorbed]
+
+    # Step 3: enforce ISI rule on current complex bursts (including post-merge bursts)
+    demoted_complex_records = []
+    if len(complex_bursts) > 0:
+        cs_set = set(complex_spikes)
+        kept_records = []
+        for (s, e) in sorted(complex_bursts, key=lambda x: x[0]):
+            spks = sorted([sp for sp in cs_set if s <= sp <= e])
+            if _passes_complex_isi(spks):
+                kept_records.append({'start': s, 'end': e, 'spikes': spks})
+            else:
+                demoted_complex_records.append({'start': s, 'end': e, 'spikes': spks})
+
+        complex_bursts = [(r['start'], r['end']) for r in kept_records]
+        complex_spikes = [sp for r in kept_records for sp in r['spikes']]
+        if len(demoted_complex_records) > 0:
+            demoted_spikes = [sp for r in demoted_complex_records for sp in r['spikes']]
+            simple_burst_spikes.extend(demoted_spikes)
+
+    # -----------------------------------------------------------------
+    # Rebuild burst_metrics for merged complex bursts
+    # -----------------------------------------------------------------
+    if merge_CB_ms is not None or merge_SS_ms is not None:
+        # Remove old complex entries from burst_metrics
+        burst_metrics = [b for b in burst_metrics if not b.get('is_complex')]
+        # Add updated complex entries
+        for (s, e) in complex_bursts:
+            spks_in = [sp for sp in complex_spikes if s <= sp <= e]
+            window = Vm_finite[s:e + 1]
+            peak_raw = np.nanmax(window) if len(window) > 0 else np.nan
+            baseline = _local_baseline(s)
+            peak_amp = peak_raw - baseline if baseline_subtract else peak_raw
+            duration_ms = (e - s + 1) * 1000 / fr
+            auc = np.trapz(np.clip(window, 0, None), dx=1 / fr) if len(window) > 0 else 0.0
+            burst_metrics.append({
+                'start': s,
+                'end': e,
+                'n_spikes': len(spks_in),
+                'peak_amp': peak_amp,
+                'baseline': baseline,
+                'duration_ms': duration_ms,
+                'auc': auc,
+                'min_isi_ms': _burst_min_isi_ms(spks_in),
+                'is_complex': True,
+                'is_plateau': False,
+                'is_single': False,
+            })
+        # Add demoted merged CB entries as non-complex burst records
+        for rec in demoted_complex_records:
+            s = rec['start']
+            e = rec['end']
+            spks_in = rec['spikes']
+            window = Vm_finite[s:e + 1]
+            peak_raw = np.nanmax(window) if len(window) > 0 else np.nan
+            baseline = _local_baseline(s)
+            peak_amp = peak_raw - baseline if baseline_subtract else peak_raw
+            duration_ms = (e - s + 1) * 1000 / fr
+            auc = np.trapz(np.clip(window, 0, None), dx=1 / fr) if len(window) > 0 else 0.0
+            burst_metrics.append({
+                'start': s,
+                'end': e,
+                'n_spikes': len(spks_in),
+                'peak_amp': peak_amp,
+                'baseline': baseline,
+                'duration_ms': duration_ms,
+                'auc': auc,
+                'min_isi_ms': _burst_min_isi_ms(spks_in),
+                'is_complex': False,
+                'is_plateau': False,
+                'is_single': len(spks_in) == 1,
+            })
+
+    # Re-add plateau spikes to complex_spikes (merge steps only rebuild from CB records)
+    complex_spikes = list(set(complex_spikes) | set(plateau_spikes))
+
+    single_spikes = np.array(single_spikes, dtype=np.int64)
+    complex_spikes = np.sort(np.array(complex_spikes, dtype=np.int64))
+    simple_burst_spikes = np.array(simple_burst_spikes, dtype=np.int64)
+    if len(simple_burst_spikes) > 0 and len(single_spikes) > 0:
+        simple_spikes_all = np.sort(np.concatenate([simple_burst_spikes, single_spikes]))
+    elif len(simple_burst_spikes) > 0:
+        simple_spikes_all = np.sort(simple_burst_spikes)
+    else:
+        simple_spikes_all = np.sort(single_spikes)
+
+    complex_entries = [b for b in burst_metrics if b.get('is_complex')]
+    starts = np.array([b['start'] for b in complex_entries], dtype=np.int64)
+    ends = np.array([b['end'] for b in complex_entries], dtype=np.int64)
+    durations_ms = np.array([b['duration_ms'] for b in complex_entries], dtype=np.int64)
+    amplitudes = np.array([b['peak_amp'] for b in complex_entries], dtype=float)
+    baselines = np.array([b.get('baseline', 0.0) for b in complex_entries], dtype=float)
+    locs = []
+    peaks = []
+    for start, end in zip(starts, ends):
+        seg = Vm[start:end + 1]
+        if len(seg) == 0 or not np.any(np.isfinite(seg)):
+            locs.append(start)
+            peaks.append(np.nan)
+            continue
+        rel_idx = int(np.nanargmax(seg))
+        loc = start + rel_idx
+        locs.append(loc)
+        peaks.append(Vm[loc])
+    locs = np.array(locs, dtype=np.int64)
+    peaks = np.array(peaks, dtype=float)
+
+    complex_bursts_dict_vm = {
+        'complex_bursts': locs.copy(),
+        'starts': starts,
+        'ends': ends,
+        'durations_ms': durations_ms,
+        'amplitudes': amplitudes,
+        'baselines': baselines,
+        'locs': locs,
+        'peaks': peaks,
+        'trace_mf': Vm.copy(),
+    }
+
+    # -----------------------------------------------------------------
+    # Build plateaus_dict from convolution-detected plateaus
+    # -----------------------------------------------------------------
+    pl_starts = np.array([pw[0] for pw in plateau_windows_detected], dtype=np.int64)
+    pl_ends = np.array([pw[1] for pw in plateau_windows_detected], dtype=np.int64)
+    pl_durations = (pl_ends - pl_starts + 1) * 1000.0 / fr
+    pl_baselines_arr = np.array([_local_baseline(ps) for ps in pl_starts], dtype=float)
+    pl_amplitudes = np.array([
+        np.nanmax(Vm_finite[ps:pe + 1]) - (bl if baseline_subtract else 0.0)
+        for ps, pe, bl in zip(pl_starts, pl_ends, pl_baselines_arr)
+    ], dtype=float)
+    pl_locs = []
+    pl_peaks = []
+    pl_spike_indices = []
+    plateau_spikes_set = set(plateau_spikes)
+    for ps, pe in zip(pl_starts, pl_ends):
+        seg = Vm[ps:pe + 1]
+        if len(seg) == 0 or not np.any(np.isfinite(seg)):
+            pl_locs.append(ps)
+            pl_peaks.append(np.nan)
+        else:
+            rel_idx = int(np.nanargmax(seg))
+            pl_locs.append(ps + rel_idx)
+            pl_peaks.append(Vm[ps + rel_idx])
+        spks_in = np.array(sorted([sp for sp in plateau_spikes_set if ps <= sp <= pe]), dtype=np.int64)
+        pl_spike_indices.append(spks_in)
+    pl_locs = np.array(pl_locs, dtype=np.int64)
+    pl_peaks = np.array(pl_peaks, dtype=float)
+    pl_n_spikes = np.array([len(si) for si in pl_spike_indices], dtype=np.int64)
+
+    plateaus_dict = {
+        'starts': pl_starts,
+        'ends': pl_ends,
+        'durations_ms': pl_durations,
+        'amplitudes': pl_amplitudes,
+        'baselines': pl_baselines_arr,
+        'locs': pl_locs,
+        'peaks': pl_peaks,
+        'n_spikes': pl_n_spikes,
+        'spike_indices': pl_spike_indices,
+    }
+
+    # -----------------------------------------------------------------
+    # Optional PDF plot using internal high-pass filtered trace & Vm
+    # -----------------------------------------------------------------
+    if plotflag and pdf is not None:
+        from matplotlib.lines import Line2D
+
+        simple_spike_color = '#026C80'
+        complex_spike_color = '#EE9B00'
+
+        segment_frames = int(segment_duration * fr)
+        n_segments = int(np.ceil(n / segment_frames))
+        n_pages = int(np.ceil(n_segments / rows_per_page))
+
+        y_min = np.nanmin(trace_snr_interpolated)
+        y_max = np.nanmax(trace_snr_interpolated)
+        y_range = [y_min, y_max]
+
+        # CB durations and amplitudes for annotation
+        cb_durations_ms = (ends - starts + 1) * 1000.0 / fr
+        cb_entries = [b for b in burst_metrics if b.get('is_complex')]
+        cb_baselines = np.array([b.get('baseline', 0.0) for b in cb_entries], dtype=float)
+        cb_peak_amps = np.array([b['peak_amp'] for b in cb_entries], dtype=float)
+
+        # Plateau durations
+        pl_durations_ms = (pl_starts - pl_starts)  # placeholder
+        if len(pl_starts) > 0:
+            pl_durations_ms = (pl_ends - pl_starts + 1) * 1000.0 / fr
+
+        for page_idx in range(n_pages):
+            start_seg = page_idx * rows_per_page
+            end_seg = min((page_idx + 1) * rows_per_page, n_segments)
+            n_rows_this_page = end_seg - start_seg
+
+            fig, axes = plt.subplots(n_rows_this_page, 1, figsize=(12, 0.8 * n_rows_this_page), sharex=False, sharey=True)
+            if n_rows_this_page == 1:
+                axes = [axes]
+
+            for row_idx, seg_idx in enumerate(range(start_seg, end_seg)):
+                ax = axes[row_idx]
+                sf = seg_idx * segment_frames
+                ef = min((seg_idx + 1) * segment_frames, n)
+
+                x_frames = np.arange(sf, ef)
+                ax.plot(x_frames, trace_snr_interpolated[sf:ef], color='gray', linewidth=0.5)
+                ax.plot(x_frames, Vm[sf:ef], color='black', linewidth=0.8)
+                ax.plot(x_frames, plateau_score[sf:ef], color='blue', linewidth=0.5, alpha=0.6)
+                ax.axhline(plateau_amp_threshold, color='blue', linewidth=0.3, linestyle='--', alpha=0.4)
+
+                # CB shading + amplitude line + duration text
+                for i, (cs_s, cs_e) in enumerate(zip(starts, ends)):
+                    if cs_e >= sf and cs_s <= ef:
+                        rs = max(cs_s, sf)
+                        re = min(cs_e, ef)
+                        ax.fill_between([rs, re], y_range[0], y_range[1],
+                                        color='yellow', alpha=0.3, linewidth=0)
+                        mid_x = (rs + re) / 2
+                        ax.text(mid_x, y_range[0], f'{cb_durations_ms[i]:.1f}', fontsize=4,
+                                ha='center', va='bottom', color='#886600')
+
+                        # Amplitude line from baseline to peak
+                        if i < len(locs) and locs[i] >= sf and locs[i] <= ef:
+                            peak_y = peaks[i]
+                            base_y = cb_baselines[i]
+                            loc_x = locs[i]
+                            ax.plot([loc_x, loc_x], [base_y, peak_y], color='#CC6600',
+                                    linewidth=0.8, linestyle='-')
+                            ax.text(loc_x + segment_frames * 0.005, (base_y + peak_y) / 2,
+                                    f'{cb_peak_amps[i]:.2f}', fontsize=4, ha='left', va='center',
+                                    color='#CC6600')
+
+                # Plateau shading + duration text
+                for j, (ps, pe) in enumerate(zip(pl_starts, pl_ends)):
+                    if pe >= sf and ps <= ef:
+                        rs = max(ps, sf)
+                        re = min(pe, ef)
+                        ax.fill_between([rs, re], y_range[0], y_range[1],
+                                        color='red', alpha=0.2, linewidth=0)
+                        mid_x = (rs + re) / 2
+                        if len(pl_durations_ms) > j:
+                            ax.text(mid_x, y_range[0], f'{pl_durations_ms[j]:.1f}', fontsize=4,
+                                    ha='center', va='bottom', color='darkred')
+
+                # Spikes
+                ss_seg = simple_spikes_all[(simple_spikes_all >= sf) & (simple_spikes_all < ef)]
+                if len(ss_seg) > 0:
+                    ax.plot(ss_seg, trace_snr_interpolated[ss_seg], 'o', color=simple_spike_color, markersize=1)
+
+                cs_seg = complex_spikes[(complex_spikes >= sf) & (complex_spikes < ef)]
+                if len(cs_seg) > 0:
+                    ax.plot(cs_seg, trace_snr_interpolated[cs_seg], 'o', color=complex_spike_color, markersize=1)
+
+                ax.set_ylim(y_range)
+                ax.set_xlim(sf, ef)
+                ax.set_yticks([])
+                ax.set_xticks([])
+                for sp in ax.spines.values():
+                    sp.set_visible(False)
+
+                ax.text(sf, y_range[1], f'{sf / fr:.1f}s', fontsize=8, ha='left', va='top')
+                ax.text(ef, y_range[1], f'{ef / fr:.1f}s', fontsize=8, ha='right', va='top')
+
+            if page_idx == 0:
+                legend_elements = [
+                    Line2D([0], [0], color='gray', linewidth=0.5, label='Trace (HP)'),
+                    Line2D([0], [0], color='black', linewidth=0.8, label='Vm (HP)'),
+                    Line2D([0], [0], marker='o', color='w', markerfacecolor=simple_spike_color, markersize=5, label='Simple Spikes'),
+                    Line2D([0], [0], marker='o', color='w', markerfacecolor=complex_spike_color, markersize=5, label='Complex Spikes'),
+                    Line2D([0], [0], color='yellow', linewidth=8, alpha=0.5, label='Complex Bursts'),
+                    Line2D([0], [0], color='red', linewidth=8, alpha=0.3, label='Plateaus'),
+                    Line2D([0], [0], color='#CC6600', linewidth=1, label='CB Amplitude'),
+                    Line2D([0], [0], color='blue', linewidth=0.5, alpha=0.6, label='Plateau Score'),
+                ]
+                axes[0].legend(handles=legend_elements, loc='upper right', ncol=4, fontsize=7, framealpha=0.8)
+
+            plt.subplots_adjust(hspace=0.0, top=1, bottom=0.0)
+            pdf.savefig(fig, bbox_inches='tight')
+            plt.close(fig)
+
+    return simple_spikes_all, complex_spikes, all_spikes, trace_snr_interpolated_unfiltered, Vm_unfiltered, burst_metrics, complex_bursts_dict_vm, plateaus_dict
+
+
+def platue_detection(trace_idx, spike_heights_interpolated, all_spikes, fr,
+                     complex_bursts_dict=None,
+                     highpass=1.0, median_window=11,
+                     baseline_subtract=False, baseline_window_ms=20, baseline_percentile=10,
+                     vm_crossing_threshold=0.1,
+                     plateau_duration_threshold=100, plateau_amp_threshold=0.5,
+                     plateau_kernel_ms=100, plateau_score_min_ms=20, plateau_min_spikes=1,
+                     drop_reject_enabled=True, drop_abs_threshold=0.35, drop_frac_threshold=0.45,
+                     drop_min_after_peak_ms=8.0):
+    """
+    Standalone plateau detector (separate from simple/complex spike classification).
+
+    This is intentionally named `platue_detection` to match existing notebook naming.
+    It is derived from the plateau path inside `detect_bursts_from_vm_platue`.
+
+    Returns:
+        plateaus_dict, debug_dict
+    """
+    trace_idx = np.asarray(trace_idx, dtype=float).ravel()
+    spike_heights_interpolated = np.asarray(spike_heights_interpolated, dtype=float).ravel()
+    all_spikes = np.asarray(all_spikes, dtype=np.int64).ravel()
+    n = len(trace_idx)
+
+    empty_plateaus = {
+        'starts': np.array([], dtype=np.int64),
+        'ends': np.array([], dtype=np.int64),
+        'durations_ms': np.array([], dtype=float),
+        'amplitudes': np.array([], dtype=float),
+        'baselines': np.array([], dtype=float),
+        'locs': np.array([], dtype=np.int64),
+        'peaks': np.array([], dtype=float),
+        'n_spikes': np.array([], dtype=np.int64),
+        'spike_indices': [],
+        'drop_abs': np.array([], dtype=float),
+        'drop_frac': np.array([], dtype=float),
+        'rejected_drop_windows': [],
+    }
+    empty_debug = {
+        'vm': np.array([], dtype=float),
+        'trace_snr_unfiltered': np.array([], dtype=float),
+        'trace_snr_filtered': np.array([], dtype=float),
+        'plateau_score': np.array([], dtype=float),
+        'candidate_windows': [],
+    }
+
+    if n == 0:
+        return empty_plateaus, empty_debug
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        trace_snr_interpolated = trace_idx / spike_heights_interpolated
+    trace_snr_unfiltered = trace_snr_interpolated.copy()
+
+    trace_snr_interpolated[~np.isfinite(trace_snr_interpolated)] = np.nan
+    trace_snr_interpolated = interpolate_nan_segment(trace_snr_interpolated)
+
+    trace_snr_no_cs = trace_snr_interpolated.copy()
+    if isinstance(complex_bursts_dict, dict):
+        starts_cb = np.asarray(complex_bursts_dict.get('starts', []), dtype=np.int64)
+        ends_cb = np.asarray(complex_bursts_dict.get('ends', []), dtype=np.int64)
+        for start, end in zip(starts_cb, ends_cb):
+            s = max(0, int(start))
+            e = min(n - 1, int(end))
+            if s <= e:
+                trace_snr_no_cs[s:e + 1] = np.nan
+    trace_snr_no_cs = interpolate_nan_segment(trace_snr_no_cs)
+
+    if highpass and highpass > 0:
+        hp_median_window = int(np.round(fr / highpass))
+        hp_median_window = hp_median_window + 1 if hp_median_window % 2 == 0 else hp_median_window
+        slow_baseline = median_filter(trace_snr_no_cs, size=max(1, hp_median_window))
+        trace_snr_interpolated = trace_snr_interpolated - slow_baseline
+
+    Vm = get_subthreshold_activity(trace_snr_interpolated, all_spikes, median_window=median_window)
+    Vm_finite = np.where(np.isfinite(Vm), Vm, 0.0)
+
+    baseline_window_frames = max(1, int(np.round(baseline_window_ms * fr / 1000)))
+
+    def _local_baseline(start_idx):
+        if not baseline_subtract:
+            return 0.0
+        base_start = max(0, int(start_idx) - baseline_window_frames)
+        base_end = max(0, int(start_idx))
+        region = Vm[base_start:base_end]
+        region = region[np.isfinite(region)]
+        if region.size == 0:
+            return 0.0
+        if baseline_percentile is None:
+            return float(np.nanmin(region))
+        return float(np.nanpercentile(region, baseline_percentile))
+
+    spike_times = all_spikes[(all_spikes >= 0) & (all_spikes < n)]
+    spike_times = np.sort(np.unique(spike_times))
+    crossing_thr = float(vm_crossing_threshold) if vm_crossing_threshold is not None else 0.1
+
+    kernel_frames = max(1, int(np.round(plateau_kernel_ms * fr / 1000)))
+    kernel = np.ones(kernel_frames, dtype=float) / float(kernel_frames)
+    plateau_score = np.convolve(Vm_finite, kernel, mode='same')
+
+    score_above = plateau_score >= float(plateau_amp_threshold)
+    score_diff = np.diff(score_above.astype(np.int8))
+    score_rises = np.where(score_diff == 1)[0] + 1
+    score_falls = np.where(score_diff == -1)[0] + 1
+    if score_above[0]:
+        score_rises = np.concatenate([[0], score_rises])
+    if score_above[-1]:
+        score_falls = np.concatenate([score_falls, [len(plateau_score)]])
+
+    pre_plateau_windows = []
+    sri = 0
+    sfi = 0
+    while sri < len(score_rises) and sfi < len(score_falls):
+        sr = score_rises[sri]
+        while sfi < len(score_falls) and score_falls[sfi] <= sr:
+            sfi += 1
+        if sfi >= len(score_falls):
+            break
+        sf = score_falls[sfi]
+        pre_plateau_windows.append((int(sr), int(sf) - 1))
+        sri += 1
+        sfi += 1
+
+    score_min_frames = max(1, int(np.round(plateau_score_min_ms * fr / 1000)))
+    pre_plateau_windows = [(s, e) for s, e in pre_plateau_windows if (e - s + 1) >= score_min_frames]
+
+    plateau_duration_frames = max(1, int(np.round(plateau_duration_threshold * fr / 1000)))
+    drop_guard_frames = max(1, int(np.round(drop_min_after_peak_ms * fr / 1000)))
+    plateau_windows_detected = []
+    rejected_drop_windows = []
+
+    for cand_s, cand_e in pre_plateau_windows:
+        mid = (cand_s + cand_e) // 2
+        if Vm_finite[mid] <= crossing_thr:
+            vm_seg = Vm_finite[cand_s:cand_e + 1]
+            pos_indices = np.where(vm_seg > crossing_thr)[0]
+            if len(pos_indices) == 0:
+                continue
+            mid = cand_s + pos_indices[len(pos_indices) // 2]
+
+        refined_s = mid
+        while refined_s > 0 and Vm_finite[refined_s - 1] > crossing_thr:
+            refined_s -= 1
+        refined_e = mid
+        while refined_e < n - 1 and Vm_finite[refined_e + 1] > crossing_thr:
+            refined_e += 1
+
+        if (refined_e - refined_s + 1) < plateau_duration_frames:
+            continue
+
+        spks_in = spike_times[(spike_times >= refined_s) & (spike_times <= refined_e)]
+        if len(spks_in) < int(max(0, plateau_min_spikes)):
+            continue
+
+        seg = Vm_finite[refined_s:refined_e + 1]
+        if seg.size == 0 or not np.any(np.isfinite(seg)):
+            continue
+        rel_peak = int(np.nanargmax(seg))
+        peak_val = float(seg[rel_peak])
+        base_val = _local_baseline(refined_s)
+        amp_val = peak_val - base_val if baseline_subtract else peak_val
+
+        drop_abs = 0.0
+        drop_frac = 0.0
+        tail_start = rel_peak + drop_guard_frames
+        if tail_start < len(seg):
+            tail_min = float(np.nanmin(seg[tail_start:]))
+            drop_abs = max(0.0, peak_val - tail_min)
+            denom = max(abs(amp_val), 1e-12)
+            drop_frac = drop_abs / denom
+
+        if bool(drop_reject_enabled) and (drop_abs >= float(drop_abs_threshold)) and (drop_frac >= float(drop_frac_threshold)):
+            rejected_drop_windows.append({
+                'start': int(refined_s),
+                'end': int(refined_e),
+                'drop_abs': float(drop_abs),
+                'drop_frac': float(drop_frac),
+            })
+            continue
+
+        window = (int(refined_s), int(refined_e))
+        if window not in plateau_windows_detected:
+            plateau_windows_detected.append(window)
+
+    pl_starts = np.array([pw[0] for pw in plateau_windows_detected], dtype=np.int64)
+    pl_ends = np.array([pw[1] for pw in plateau_windows_detected], dtype=np.int64)
+    pl_durations = (pl_ends - pl_starts + 1) * 1000.0 / fr if len(pl_starts) else np.array([], dtype=float)
+    pl_baselines = np.array([_local_baseline(ps) for ps in pl_starts], dtype=float) if len(pl_starts) else np.array([], dtype=float)
+    pl_amplitudes = np.array([
+        (np.nanmax(Vm_finite[ps:pe + 1]) - bl) if baseline_subtract else np.nanmax(Vm_finite[ps:pe + 1])
+        for ps, pe, bl in zip(pl_starts, pl_ends, pl_baselines)
+    ], dtype=float) if len(pl_starts) else np.array([], dtype=float)
+
+    pl_locs = []
+    pl_peaks = []
+    pl_spike_indices = []
+    pl_drop_abs = []
+    pl_drop_frac = []
+    for ps, pe, bl in zip(pl_starts, pl_ends, pl_baselines):
+        seg = Vm[ps:pe + 1]
+        if seg.size == 0 or not np.any(np.isfinite(seg)):
+            loc = int(ps)
+            peak = np.nan
+            drop_abs = 0.0
+            drop_frac = 0.0
+        else:
+            rel_idx = int(np.nanargmax(seg))
+            loc = int(ps + rel_idx)
+            peak = float(Vm[loc])
+            tail_start = rel_idx + drop_guard_frames
+            if tail_start < len(seg):
+                tail_min = float(np.nanmin(seg[tail_start:]))
+                drop_abs = max(0.0, peak - tail_min)
+                amp = (peak - bl) if baseline_subtract else peak
+                drop_frac = drop_abs / max(abs(amp), 1e-12)
+            else:
+                drop_abs = 0.0
+                drop_frac = 0.0
+        pl_locs.append(loc)
+        pl_peaks.append(peak)
+        spks_in = spike_times[(spike_times >= ps) & (spike_times <= pe)]
+        pl_spike_indices.append(np.asarray(spks_in, dtype=np.int64))
+        pl_drop_abs.append(float(drop_abs))
+        pl_drop_frac.append(float(drop_frac))
+
+    pl_locs = np.asarray(pl_locs, dtype=np.int64)
+    pl_peaks = np.asarray(pl_peaks, dtype=float)
+    pl_n_spikes = np.asarray([len(si) for si in pl_spike_indices], dtype=np.int64)
+
+    plateaus_dict = {
+        'starts': pl_starts,
+        'ends': pl_ends,
+        'durations_ms': np.asarray(pl_durations, dtype=float),
+        'amplitudes': pl_amplitudes,
+        'baselines': pl_baselines,
+        'locs': pl_locs,
+        'peaks': pl_peaks,
+        'n_spikes': pl_n_spikes,
+        'spike_indices': pl_spike_indices,
+        'drop_abs': np.asarray(pl_drop_abs, dtype=float),
+        'drop_frac': np.asarray(pl_drop_frac, dtype=float),
+        'rejected_drop_windows': rejected_drop_windows,
+    }
+
+    debug_dict = {
+        'vm': np.asarray(Vm, dtype=float),
+        'trace_snr_unfiltered': np.asarray(trace_snr_unfiltered, dtype=float),
+        'trace_snr_filtered': np.asarray(trace_snr_interpolated, dtype=float),
+        'plateau_score': np.asarray(plateau_score, dtype=float),
+        'candidate_windows': pre_plateau_windows,
+    }
+    return plateaus_dict, debug_dict
+
+
+# Alias with correct spelling for convenience
+plateau_detection = platue_detection
 
 
 def adaptive_thresh(pks, clip, pnorm=0.5, min_spikes=10):
@@ -1333,21 +2242,36 @@ def complex_bursts_detection(trace, spike_times, frame_rate, process_window=60, 
         List of (start_frame, end_frame) tuples for each segment
     """
     if len(spike_times) == 0:
-        # Return empty dict if no spikes
+        # Keep return schema consistent with the non-empty path.
+        trace_len = len(trace)
+        empty_trace = np.full(trace_len, np.nan, dtype=float)
         return {
-            'complex_bursts': np.array([]).astype(np.int64),
-            'starts': np.array([]).astype(np.int64),
-            'ends': np.array([]).astype(np.int64),
-            'durations_ms': np.array([]).astype(np.int64),
-            'amplitudes': np.array([]),
-            'baselines': np.array([]),
-            'locs': np.array([]).astype(np.int64),
-            'peaks': np.array([])
+            'complex_bursts': np.array([], dtype=np.int64),
+            'starts': np.array([], dtype=np.int64),
+            'ends': np.array([], dtype=np.int64),
+            'durations_ms': np.array([], dtype=np.int64),
+            'amplitudes': np.array([], dtype=float),
+            'baselines': np.array([], dtype=float),
+            'locs': np.array([], dtype=np.int64),
+            'peaks': np.array([], dtype=float),
+            'trace_mf': empty_trace.copy(),
+            'trace_filt': empty_trace.copy(),
+            'trace_filt_wmf': empty_trace.copy(),
         }, []
 
-    spike_times = np.array(spike_times)
+    spike_times = np.asarray(spike_times).ravel()
+    # Sanitize spike indices before indexing into trace:
+    # keep finite integer-like values in [0, len(trace)-1].
+    if spike_times.size == 0:
+        spike_times = np.array([], dtype=np.int64)
+    else:
+        finite_mask = np.isfinite(spike_times)
+        spike_times = spike_times[finite_mask]
+        spike_times = spike_times.astype(np.int64, copy=False)
+        in_bounds = (spike_times >= 0) & (spike_times < int(trace.shape[0]))
+        spike_times = spike_times[in_bounds]
     # Remove spikes when trace is NaN
-    spike_times = np.array([t for t in spike_times if not np.isnan(trace[t])])
+    spike_times = np.array([t for t in spike_times if not np.isnan(trace[t])], dtype=np.int64)
     
     print(f'Trace length: {trace.shape[0]} frames')
 
@@ -2522,7 +3446,7 @@ def spike_height_calculation2(refined_SS, trace_idx, trace_idx_mf, trace_noCS, f
                 continue
             if np.isnan(trace_idx[ss]):
                 continue
-            baseline_region = trace_idx_mf[max(0, ss - 3):ss]
+            baseline_region = trace_idx[max(0, ss - 3):ss]
             baseline = np.min(baseline_region) if len(baseline_region) else 0
             peak_value = trace_idx[ss]
             simple_spike_heights.append(peak_value - baseline)
@@ -2800,7 +3724,7 @@ def detect_complex_spikes(trace, complex_bursts_dict, spike_heights_interpolated
             baseline_start = max(0, abs_pk - 2)
             baseline_region = trace_mf[baseline_start:abs_pk]
             if len(baseline_region) == 0:
-                baseline = trace_mf[abs_pk]
+                baseline = trace[abs_pk]
             else:
                 baseline = np.min(baseline_region)
 

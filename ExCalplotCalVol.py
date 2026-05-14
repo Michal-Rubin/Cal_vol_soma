@@ -54,6 +54,7 @@ from scipy.ndimage import center_of_mass
 import sys
 # Add the folder containing your BatchRunSpatialFootLocal.py
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\code')
 from BatchRunSpatialFootLocal import get_rois_mask,volS,trace_extraction,save_volpy_plots, plot_roi_masks
 from SpikeDetection2 import SNRcalculate
 pio.renderers.default = "vscode"
@@ -66,7 +67,8 @@ def calDF(Vol):
     for i in range(0,(np.size(NoBackVol,0))):
         currTrace = NoBackVol[int(i),]
         NoBacksORT = np.sort(currTrace)
-        F0 = np.mean(NoBacksORT[0:round(len(currTrace)*0.1)])
+        F0 = np.percentile(currTrace,8) # 8th percentile
+        #F0 = np.mean(NoBacksORT[0:round(len(currTrace)*0.1)])
         dfVOL[i,:] = (currTrace-F0)/F0
     return dfVOL
 
@@ -170,6 +172,58 @@ def highpass_filter(trace, fs, cutoff_hz=0.5, order=3):
     b, a = butter(order, cutoff_hz / ny, btype='highpass')
     return filtfilt(b, a, trace)
 
+
+def fps_from_indices(frame_idx, SR=30000.0):
+    frame_idx = np.asarray(frame_idx, dtype=float).ravel()
+    frame_idx = frame_idx[np.isfinite(frame_idx)]
+    if frame_idx.size < 2:
+        return np.nan, np.array([])
+    frame_idx = np.unique(frame_idx.astype(int))
+    if frame_idx.size < 2:
+        return np.nan, np.array([])
+    dt = np.diff(frame_idx) / float(SR)  # seconds
+    dt = dt[np.isfinite(dt) & (dt > 0)]
+    if dt.size == 0:
+        return np.nan, np.array([])
+    fps = 1.0 / np.median(dt)
+    return float(fps), dt
+
+
+def estimate_cal_sr_from_thorsync(thor_h5_path, SR=30000.0, default_sr=30.0):
+    if (thor_h5_path is None) or (not os.path.isfile(thor_h5_path)):
+        return float(default_sr)
+    try:
+        with h5py.File(thor_h5_path, "r") as f:
+            ygalvo = None
+            for gk in list(f.keys()):
+                grp = f[gk]
+                if not hasattr(grp, "keys"):
+                    continue
+                for dk in list(grp.keys()):
+                    if str(dk).lower() == "ygalvo":
+                        ygalvo = np.asarray(grp[dk]).squeeze()
+                        break
+                if ygalvo is not None:
+                    break
+        if ygalvo is None:
+            return float(default_sr)
+        ygalvo = np.asarray(ygalvo, dtype=float).ravel()
+        if ygalvo.size < 500:
+            return float(default_sr)
+        L = np.convolve(np.diff(ygalvo), np.ones(5) / 5.0, mode="valid")
+        cal_idx, _ = find_peaks(-L, height=0.08, distance=80)
+        if cal_idx.size <= 1:
+            cal_idx, _ = find_peaks(L, height=0.08, distance=80)
+        if cal_idx.size < 2:
+            return float(default_sr)
+        fps_cal, _ = fps_from_indices(cal_idx, SR=SR)
+        if not np.isfinite(fps_cal) or fps_cal <= 0:
+            return float(default_sr)
+        return float(fps_cal)
+    except Exception as e:
+        print(f"[WARN] failed CALsr from ThorSync ({thor_h5_path}): {e}")
+        return float(default_sr)
+
 def plotVolCal(path, VolAX, CALax, CalTrace, VolTrace, spikeIDX, Name="syncVolCAL.html"):
     """
     Plot calcium + voltage trace for one cell.
@@ -270,14 +324,19 @@ def plotVolCal(path, VolAX, CALax, CalTrace, VolTrace, spikeIDX, Name="syncVolCA
     fig2.write_html(os.path.join(path, "spikeDET.html"))
     fig2.write_image(os.path.join(path, "spikeDET.svg"))
 ## load  vidios
-homePath = r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\srugc17\Rb\14-07-2025\fov7'
+homePath = r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\rugc46\RL2\07-01-2025-ans\fov2'
 rr = get_rois_mask(homePath)
 plot_roi_masks(rr)
 suit2Path = os.path.join(homePath,'sync','cal','suite2p','plane0','F.npy')
 MeanImagePath = os.path.join(homePath,'Mean.tif')
 MeanImage = tiff.imread(MeanImagePath)
 ts_folder = glob.glob(os.path.join(homePath, "TS_*"))
-file_path = os.path.join(ts_folder[-1], 'Episode_0000.h5')
+if len(ts_folder) > 0:
+    file_path = os.path.join(sorted(ts_folder)[-1], 'Episode_0000.h5')
+else:
+    file_path = None
+CAL_SR = estimate_cal_sr_from_thorsync(file_path, SR=30000.0, default_sr=30.0)
+#print(f"Estimated CALsr from ThorSync: {CAL_SR:.6f} Hz")
 if os.path.exists(suit2Path):
         CalTrace = np.load(suit2Path,allow_pickle=True)
         selctROI = input("Enter ROI numbers (check relevnt file in suite2p folder):")                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            
@@ -295,13 +354,22 @@ for i in range(len(rr)):
     mask = rr[i].astype(float)
     currP = os.path.join(homePath, f'cell{i}')
     suit2Path = os.path.join(currP,'suite2p','plane0','F.npy')
+    suit2PathNorophil = os.path.join(currP,'suite2p','plane0','Fneu.npy')
     if os.path.exists(suit2Path):
-        CalTrace = np.load(suit2Path,allow_pickle=True)
+        F = np.load(suit2Path, allow_pickle=True)
+        Fneu = np.load(suit2PathNorophil, allow_pickle=True)
+
         selctROI = input("Enter ROI numbers (check relevnt file in suite2p folder):")                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            
         selctROI =  selctROI.split(',')
         selctROI = [int(x) for x in selctROI]
         CalTrace = np.array(CalTrace[selctROI])
-    CalTrace =CalTrace[:,:]
+        F = F[selctROI]
+        Fneu = Fneu[selctROI]
+
+        # neuropil subtraction
+        neuropil_coeff = 0.7
+        CalTrace = F - neuropil_coeff * Fneu
+        CalTrace =CalTrace[:,:]
     CalDf = calDF(CalTrace)
     TracPpath = os.path.join(currP,'volTrace.csv')
     SpikeTimePath = os.path.join(currP,'SpikeIdx.csv')
@@ -317,13 +385,13 @@ for i in range(len(rr)):
     Snr = SNRcalculate(Trace,spikeTime)
     RelCal = CalTrace[i,:]
     RelCalDF = CalDf[i,:]
-    CalPath = os.path.join(currP,'calTrace.csv')
-    CalDFPath = os.path.join(currP,'calTraceDF.csv')
-    VolDFPath = os.path.join(currP,'volTraceDF.csv')
+    CalPath = os.path.join(currP,'calTraceNB.csv')
+    CalDFPath = os.path.join(currP,'calTraceNBdf..csv')
+    VolDFPath = os.path.join(currP,'volTrace.csv')
     
     tVOL = np.linspace(0, (len(TraceDF)/500), len(TraceDF))
    
-    tCal = np.linspace(0, (len(RelCalDF)/30), len(RelCalDF))
+    tCal = np.linspace(0, (len(RelCalDF)/CAL_SR), len(RelCalDF))
 
     df = pd.DataFrame(RelCal)  # create df with column name
     df.to_csv(CalPath, index=False)
@@ -341,12 +409,12 @@ for i in range(len(rr)):
         #NotesAboutTrace = input("Notes?")
         
         if not os.path.exists(r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\Dendrites\SST.csv'):
-            DB = pd.DataFrame(columns=['Mice', 'Imaging_Seshion', 'Imaging_Date', 'Num_of_ROI','Notes', 'Link','brainState','SNR'])
+            DB = pd.DataFrame(columns=['Mice', 'Imaging_Seshion', 'Imaging_Date', 'Num_of_ROI','Notes', 'Link','brainState','SNR', 'CALsr'])
             DB.to_csv(r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\Dendrites\SST.csv',index=False)
 
         DB = pd.read_csv(r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\Dendrites\SST.csv')
         NewRow = {'Mice': MiceName, 'Imaging_Seshion':globalImagingSeshion, 'Imaging_Date':ImagingDate, 'Num_of_ROI':NumberOfFov,
-                  'Link':pathForFov, 'brainState':BrainState, 'SNR' : Snr}
+                  'Link':pathForFov, 'brainState':BrainState, 'SNR' : Snr, 'CALsr': CAL_SR}
         DB = pd.concat([DB, pd.DataFrame([NewRow])], ignore_index=True)
         DB.to_csv(r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\Dendrites\SST.csv',index=False)
 
@@ -364,11 +432,11 @@ for i in range(len(rr)):
         NumberOfFov = f'cell{i}'
         pathForFov = currP
         if not os.path.exists(r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\Dendrites\Pyr.csv'):
-            DB = pd.DataFrame(columns=['Mice', 'Imaging_Seshion', 'Imaging_Date', 'Num_of_ROI','Notes', 'Link','brainState','SNR'])
+            DB = pd.DataFrame(columns=['Mice', 'Imaging_Seshion', 'Imaging_Date', 'Num_of_ROI','Notes', 'Link','brainState','SNR', 'CALsr'])
             DB.to_csv(r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\Dendrites\Pyr.csv',index=False)
 
         DB = pd.read_csv(r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\Dendrites\Pyr.csv')
         NewRow = {'Mice': MiceName, 'Imaging_Seshion':globalImagingSeshion, 'Imaging_Date':ImagingDate, 'Num_of_ROI':NumberOfFov,
-                  'Link':pathForFov, 'brainState':BrainState, 'SNR' : Snr}
+                  'Link':pathForFov, 'brainState':BrainState, 'SNR' : Snr, 'CALsr': CAL_SR}
         DB = pd.concat([DB, pd.DataFrame([NewRow])], ignore_index=True)
         DB.to_csv(r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\Dendrites\Pyr.csv',index=False)

@@ -79,12 +79,12 @@ def fps_from_indices(frame_idx, SR=30000.0):
 
 
 
-input_folder = r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\srugc17\Rb\14-07-2025\fov8'
+input_folder = r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\rugc42\RL-REAL\fov2'
 
 SR = 30000  # ThorSync sampling rate in Hz-+ *-
 
 
-thorSyncF = os.path.join(input_folder, 'TS_0227','Episode_0000.h5')
+thorSyncF = os.path.join(input_folder, 'TS_0274','Episode_0000.h5')
 FullThor , chanName , subName = extracTHorsync(thorSyncF)
 calFrame , VolFrame, volFrameO, DAQ = frameSync(FullThor , chanName , subName)
 # plt.plot(volFrameO)
@@ -150,6 +150,7 @@ CamExp = np.diff(CamInd)/SR
 variable_range = np.concatenate(([0], np.cumsum(CamExp)))  # average camera exposure in sec
 TwoPExp = np.mean(np.diff(cal_Ind))/SR  # average 2P exposure in sec
 tpCamExp = CamInd/SR
+
 x = np.arange(0,len(tpCamExp),1)
 # plt.figure()
 # plt.scatter(x,tpCamExp)

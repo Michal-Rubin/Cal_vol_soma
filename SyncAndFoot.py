@@ -15,6 +15,7 @@ import pandas as pd
 from roipoly import MultiRoi
 import plotly.graph_objects as go
 import plotly.io as pio
+import glob
 from plotly.subplots import make_subplots
 from scipy.io import loadmat
 import glob
@@ -293,7 +294,7 @@ def syncParam(TS_path):
     
     return k,VolStart,CalEnd,CVol,CamExp,TwoPExp, MotS
 
-def SyncCalVol(thP,mc_Path,cal_Path):
+def SyncCalVol(thP,mc_Path,cal_Path,spatialFootTr):
     k,VolStart,CalEnd,CVol,CamExp,TwoPExp, MotorT, = syncParam(thP)
     
     thresh = np.median(MotorT)
@@ -316,6 +317,23 @@ def SyncCalVol(thP,mc_Path,cal_Path):
     Vol = tiff.imread(mc_Path)
     #Cal = CalNormCor(cal_Path)
     Cal = tiff.imread(cal_Path)
+    # spatialFootTr can be a DataFrame from CSV (2D) or ndarray (2D/3D).
+    # Convert once and always slice on axis 0 only.
+    if isinstance(spatialFootTr, pd.DataFrame):
+        spatialFootTr_arr = spatialFootTr.to_numpy()
+    else:
+        spatialFootTr_arr = np.asarray(spatialFootTr)
+
+    def _slice_spatial(arr, s0, e0):
+        a = np.asarray(arr)
+        if a.ndim == 0:
+            return a
+        if a.ndim == 1:
+            return a[s0:e0]
+        if a.ndim == 2:
+            return a[s0:e0, :]
+        return a[s0:e0, :, :]
+
     dir_path = os.path.dirname(cal_Path)
     #MCcal = os.path.join(dir_path,f'motion_corrected_cal.tif')
     #tiff.imsave()
@@ -323,7 +341,7 @@ def SyncCalVol(thP,mc_Path,cal_Path):
     tCAL = np.concatenate(([0], np.cumsum(TwoPExp)))   # Calcium imaging time stamps
     if k == 1:
         VOLSync = Vol[VolStart:-1,:,:]
-        
+        spatialFootTrSync = _slice_spatial(spatialFootTr_arr, VolStart, -1)
         #VOLSync = VOLSync.reshape(np.size(VOLSync,1),1)
         CALSync = Cal[:CalEnd,:,:]
         #MotorSync = motor_bin[:CalEnd]
@@ -332,6 +350,7 @@ def SyncCalVol(thP,mc_Path,cal_Path):
         tCAL = tCAL[:CalEnd].T  # Calcium imaging time stamps
     if k == 2:
         VOLSync = Vol[VolStart:CalEnd,:,:]
+        spatialFootTrSync = _slice_spatial(spatialFootTr_arr, VolStart, CalEnd)
         #MotorSync = motor_bin[:]
         #VOLSync = VOLSync.reshape(np.size(VOLSync,1),1)
         CALSync = Cal[:, :,:]
@@ -340,7 +359,7 @@ def SyncCalVol(thP,mc_Path,cal_Path):
         tCAL = tCAL[:].T  # Calcium imaging time stamps
     if k == 3:
         VOLSync = Vol[CVol:CalEnd,:,:]
-        
+        spatialFootTrSync = _slice_spatial(spatialFootTr_arr, CVol, CalEnd)
         #VOLSync = VOLSync.reshape(np.size(VOLSync,1),1)
         
         CALSync = Cal[VolStart:-1,:,:]
@@ -351,7 +370,7 @@ def SyncCalVol(thP,mc_Path,cal_Path):
         
     if k == 4:
         VOLSync = Vol[CVol:-1,:,:]
-        
+        spatialFootTrSync = _slice_spatial(spatialFootTr_arr, CVol, -1)
         #VOLSync = VOLSync.reshape(np.size(VOLSync,1),1)
         CALSync = Cal[VolStart:CalEnd,:,:]
         #MotorSync = motor_bin[VolStart:CalEnd]
@@ -375,12 +394,12 @@ def SyncCalVol(thP,mc_Path,cal_Path):
     
     motor_bin = (MotorSync_ds > thresh).astype(int)
     
-    plt.plot(motor_bin,alpha=0.5)
-    plt.plot(CamExp,alpha=0.5)
-    plt.scatter(VolStart,CamExp[VolStart])
-    plt.scatter(VolStart,motor_bin[VolStart])
+    # plt.plot(motor_bin,alpha=0.5)
+    # plt.plot(CamExp,alpha=0.5)
+    # plt.scatter(VolStart,CamExp[VolStart])
+    # plt.scatter(VolStart,motor_bin[VolStart])
     parentP = os.path.dirname(thP)
-    plt.savefig(os.path.join(parentP,f'dd.png'), dpi=300, bbox_inches="tight")
+    # plt.savefig(os.path.join(parentP,f'dd.png'), dpi=300, bbox_inches="tight")
     print(len(motor_bin))
     #manual cut
     # volCut = 3000
@@ -404,7 +423,7 @@ def SyncCalVol(thP,mc_Path,cal_Path):
     #plt.plot(volFrameO.flatten()[CamInd], 'b.', markersize=10)
     #parentP = os.path.dirname(thP)
     #plt.savefig(os.path.join(parentP,f'ff.png'), dpi=300, bbox_inches="tight") 
-    return CALSync,VOLSync, motor_bin,tVOL,tCAL
+    return CALSync,VOLSync, motor_bin,tVOL,tCAL, spatialFootTrSync
 
 def CalNormCor(calPath):
     
@@ -606,7 +625,15 @@ if __name__  == "__main__":
                 # r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\RUGC44\L\12-01-2025-awake\fov17\2',
                 # r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\RUGC44\L\24-11-2025-ANS\FOV1',
                 #r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\RUGC44\L\24-11-2025-ANS\fov2',
-                r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\srugc17\Rb\14-07-2025\fov8'
+                r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\RUGC40\R\18-08-2025-ans\fov1',
+                r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\rugc42\RL-REAL\FOV1',
+                
+                r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\RUGC40\R\18-08-2025-ans\fov2',
+                r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\RUGC40\L\18-08-2025-ans\fov6',
+                r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\rugc42\Wh\17-09-2025-rugc42-wh-s1-ans\fov1\2',
+                r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\rugc41\RW\30-09-2025-MOTOR\FOV1',
+                r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\rugc42\Wh\19-11-2025-awake\fov19',
+                r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\rugc42\Wh\19-11-2025-awake\fov20'
                   ]
     # DB = pd.read_csv(r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\Dendrites\NewMetaDataSSTgood.csv')
 
@@ -620,9 +647,16 @@ if __name__  == "__main__":
         print(currP)
         calTiff = os.path.join(currP,'cal','Image_scan_1_region_0_0.tif')
         VolMC = os.path.join(currP,'pipeline_results','motion_corrected','motion_corrected.tiff')
+       
+
+
+        spatialFootprint = os.path.join(currP, 'pipeline_results', 'motion_corrected', 'traces')
+
+        csv_path = glob.glob(os.path.join(spatialFootprint, '*.csv'))[-1]
+        df = pd.read_csv(csv_path)
         ts_folder = glob.glob(os.path.join(currP, "TS_*"))
         file_path = os.path.join(ts_folder[-1], 'Episode_0000.h5')  # change name as needed
-        SyncCal, SyncVol,SyncMotor,volAX,calAX = SyncCalVol(file_path,VolMC,calTiff)
+        SyncCal, SyncVol,SyncMotor,volAX,calAX, spatialFootTrSync = SyncCalVol(file_path,VolMC,calTiff,df)
         new_folder = os.path.join(currP, "Sync")  # subfolder name
         
         # Create the folder if it doesn't exist

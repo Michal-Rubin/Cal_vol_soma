@@ -1,4 +1,4 @@
-import h5py
+﻿import h5py
 import numpy as np
 import matplotlib.pyplot as plt
 import scipy.signal as sc
@@ -9,6 +9,9 @@ from scipy.signal import find_peaks
 from sklearn.metrics import mean_squared_error, r2_score
 from scipy.stats import pearsonr, linregress
 import os
+import re
+import sys
+sys.path.append(r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\code')
 import csv
 import pandas as pd
 from roipoly import MultiRoi
@@ -26,6 +29,9 @@ from scipy import signal
 from scipy.fftpack import fft
 from scipy.signal import butter, filtfilt
 import pickle
+
+VOLTAGE_TRACE_COLOR = '#d62728'   # tab:red
+CALCIUM_TRACE_COLOR = 'mediumseagreen'
 
 
 def _edit_spikes_gui(raw, fs, highpass=100, verbose=True):
@@ -1155,8 +1161,122 @@ def calculate_Vm_Cal(Vmtrace ,window_size, step_size,VAx, caltRACE,CAx):
     calAvg = meanCal(window_starts,caltRACE)
     return MeanvM,calAvg,cBinn, vBinn,CtBin
 
+def _read_trace_csv_1d(csv_path):
+    arr = pd.read_csv(csv_path).to_numpy(dtype=float).ravel()
+    return np.asarray(arr, dtype=float)
+
+def _safe_corrcoef(x, y):
+    x = np.asarray(x, dtype=float).ravel()
+    y = np.asarray(y, dtype=float).ravel()
+    n = min(x.size, y.size)
+    if n < 3:
+        return -np.inf
+    x = x[:n]
+    y = y[:n]
+    ok = np.isfinite(x) & np.isfinite(y)
+    if np.sum(ok) < 3:
+        return -np.inf
+    x = x[ok]
+    y = y[ok]
+    sx = float(np.nanstd(x))
+    sy = float(np.nanstd(y))
+    if sx <= 0 or sy <= 0:
+        return -np.inf
+    return float(np.corrcoef(x, y)[0, 1])
+
+def _cell_idx_from_folder(cell_folder):
+    base = os.path.basename(os.path.normpath(cell_folder))
+    m = re.match(r"cell(\d+)$", str(base), flags=re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+def _resolve_suite2p_row_idx(cell_folder, raw_trace, suite2p_dir):
+    f_path = os.path.join(suite2p_dir, "F.npy")
+    if not os.path.isfile(f_path):
+        cell_idx = _cell_idx_from_folder(cell_folder)
+        return (cell_idx, np.nan)
+    try:
+        F = np.asarray(np.load(f_path, mmap_mode="r"))
+    except Exception:
+        cell_idx = _cell_idx_from_folder(cell_folder)
+        return (cell_idx, np.nan)
+    if F.ndim == 1:
+        F = F.reshape(1, -1)
+    if F.ndim < 2 or F.shape[0] == 0:
+        cell_idx = _cell_idx_from_folder(cell_folder)
+        return (cell_idx, np.nan)
+
+    best_idx = None
+    best_corr = -np.inf
+    for ridx in range(int(F.shape[0])):
+        corr = _safe_corrcoef(raw_trace, np.asarray(F[int(ridx)], dtype=float).ravel())
+        if corr > best_corr:
+            best_corr = corr
+            best_idx = int(ridx)
+
+    if best_idx is not None and np.isfinite(best_corr):
+        return (int(best_idx), float(best_corr))
+
+    cell_idx = _cell_idx_from_folder(cell_folder)
+    if cell_idx is not None and 0 <= int(cell_idx) < int(F.shape[0]):
+        return (int(cell_idx), np.nan)
+    return (None, np.nan)
+
+def _compute_calcium_nb_and_df(cell_folder, neuropil_r=0.7, f0_percentile=8.0, save_outputs=True):
+    raw_path = os.path.join(cell_folder, "calTrace.csv")
+    if not os.path.isfile(raw_path):
+        return None, None
+
+    cal_raw = _read_trace_csv_1d(raw_path)
+    if cal_raw.size == 0:
+        return None, None
+
+    suite2p_dir = os.path.join(os.path.dirname(cell_folder), "Sync", "cal", "suite2p", "plane0")
+    fneu_path = os.path.join(suite2p_dir, "Fneu.npy")
+    if os.path.isfile(fneu_path):
+        row_idx, row_corr = _resolve_suite2p_row_idx(cell_folder, cal_raw, suite2p_dir)
+    else:
+        row_idx, row_corr = (None, np.nan)
+
+    if row_idx is not None:
+        Fneu = np.asarray(np.load(fneu_path, mmap_mode="r"))
+        if Fneu.ndim == 1:
+            neu = Fneu.ravel().astype(float)
+        elif 0 <= int(row_idx) < int(Fneu.shape[0]):
+            neu = np.asarray(Fneu[int(row_idx)], dtype=float).ravel()
+        else:
+            neu = np.zeros_like(cal_raw)
+        n = min(cal_raw.size, neu.size)
+        cal_raw = cal_raw[:n]
+        neu = neu[:n]
+        cal_nb = cal_raw - float(neuropil_r) * neu
+    else:
+        cal_nb = cal_raw.copy()
+
+    finite = np.isfinite(cal_nb)
+    if np.any(finite):
+        baseline = float(np.nanpercentile(cal_nb[finite], float(f0_percentile)))
+    else:
+        baseline = 0.0
+    denom = baseline
+    if (not np.isfinite(denom)) or (abs(denom) < 1e-9):
+        denom = 1e-9 if (not np.isfinite(denom) or denom >= 0) else -1e-9
+    cal_df = (cal_nb - baseline) / denom
+
+    if save_outputs:
+        pd.Series(cal_nb).to_csv(os.path.join(cell_folder, "calTraceNB.csv"), index=False)
+        pd.Series(cal_df).to_csv(os.path.join(cell_folder, "calTraceDF.csv"), index=False)
+        idx_txt = os.path.join(cell_folder, "calcium_neuropil_selected_roi_idx.txt")
+        with open(idx_txt, "w", encoding="utf-8") as f:
+            f.write(f"selected_suite2p_roi_idx: {row_idx}\n")
+            f.write(f"match_corr_to_calTrace: {row_corr}\n")
+            f.write(f"neuropil_r: {float(neuropil_r)}\n")
+            f.write(f"f0_percentile: {float(f0_percentile)}\n")
+            f.write(f"suite2p_dir: {suite2p_dir}\n")
+            f.write(f"fneu_exists: {os.path.isfile(fneu_path)}\n")
+
+    return cal_nb, cal_df
+
 def dataEXTRAC(path):
-    TracePathCal = os.path.join(path,'calTraceDF.csv')
     TracePathVol = os.path.join(path,'volTraceDF.csv')
     TracePathSPIKE = os.path.join(path,'SpikeIdx.csv')
     TracePathCalAX = os.path.join(path,'calTime.csv')
@@ -1165,9 +1285,14 @@ def dataEXTRAC(path):
     VolTrace = np.array(VolTrace)
     VolTrace = VolTrace.flatten()
     Trace = VolTrace
-    CalTrace = pd.read_csv(TracePathCal)
-    CalTrace = np.array(CalTrace)
-    CalTrace = CalTrace.flatten()
+    _cal_nb, cal_df = _compute_calcium_nb_and_df(path, neuropil_r=0.7, f0_percentile=8.0, save_outputs=True)
+    if cal_df is not None and np.asarray(cal_df).size > 0:
+        CalTrace = np.asarray(cal_df, dtype=float).ravel()
+    else:
+        TracePathCal = os.path.join(path,'calTraceDF.csv')
+        CalTrace = pd.read_csv(TracePathCal)
+        CalTrace = np.array(CalTrace)
+        CalTrace = CalTrace.flatten()
     spikeId = pd.read_csv(TracePathSPIKE)
     spikeId = np.array(spikeId)
     spikeId = spikeId.flatten()
@@ -1794,8 +1919,8 @@ def plotVolCal(path, VolAX, CALax,CalTrace, VolTrace,Name,NameSV,smW =1):
     pathFig = os.path.join(path,Name)
     
     fig = make_subplots(specs=[[{"secondary_y": True}]])
-    fig.add_trace(go.Scatter(x=VolAX, y=VolTrace.squeeze(), name="Voltage",line=dict(color='red', width=2)),secondary_y=False,)
-    fig.add_trace(go.Scatter(x= CALax, y= CalTrace.squeeze(), name="Calcium",line=dict(color='blue', width=2)),secondary_y=True,)
+    fig.add_trace(go.Scatter(x=VolAX, y=VolTrace.squeeze(), name="Voltage",line=dict(color=VOLTAGE_TRACE_COLOR, width=2)),secondary_y=False,)
+    fig.add_trace(go.Scatter(x= CALax, y= CalTrace.squeeze(), name="Calcium",line=dict(color=CALCIUM_TRACE_COLOR, width=2)),secondary_y=True,)
     fig.update_layout(title_text="calcium and voltage togeter")
     fig.update_xaxes(title_text="Time(ms)")
     fig.update_yaxes(title_text="<b>Calcium</b>",secondary_y=True)
@@ -1979,8 +2104,8 @@ def remove_Frame_Multi(TraceV, TraceC, SpikeIdx, TimeV, TimeC, mot):
     # Plot
     # -------------------------------
     fig, ax = plt.subplots(figsize=(14, 5))
-    ax.plot(TimeV, TraceV, color='red', lw=0.5, label='Voltage')
-    ax.plot(TimeC, TraceC, color='blue', lw=0.5, label='calcium')
+    ax.plot(TimeV, TraceV, color=VOLTAGE_TRACE_COLOR, lw=0.5, label='Voltage')
+    ax.plot(TimeC, TraceC, color=CALCIUM_TRACE_COLOR, lw=0.5, label='calcium')
     ax.scatter(TimeV[SpikeIdx], TraceV[SpikeIdx],
                color='black', s=10, zorder=5, label='Spikes')
     ax.set_title("Zoom freely | Hold 'd' delete | Ctrl+Z undo | ENTER finish")
@@ -1992,7 +2117,7 @@ def remove_Frame_Multi(TraceV, TraceC, SpikeIdx, TimeV, TimeC, mot):
     # -------------------------------
     def redraw():
         ax.clear()
-        ax.plot(TimeV[mask_V], TraceV[mask_V], color='red', lw=0.5)
+        ax.plot(TimeV[mask_V], TraceV[mask_V], color=VOLTAGE_TRACE_COLOR, lw=0.5)
         kept_spikes = SpikeIdx[mask_V[SpikeIdx]]
         ax.scatter(TimeV[kept_spikes], TraceV[kept_spikes],
                    color='black', s=10)
@@ -2198,3 +2323,1466 @@ def windowed_fr_calcium_correlation(
         corr_list.append(r)
 
     return corr_list, np.asarray(win_t, dtype=float), mid_t, float(ws_s), (sigma_fr_s, sigma_ca_s)
+
+
+def plot_delta_corr_vs_mean_fr(
+    cell_folders,
+    *,
+    fr_sig_a=0.01,
+    cal_sig_a=0.01,
+    fr_sig_b=1.5,
+    cal_sig_b=1.5,
+    delta_order="a_minus_b",
+    label_from="basename",
+    title=None,
+    marker_size=8,
+    save_html=None,
+    save_svg=None,
+    show=True,
+):
+    """
+    Scatter plot: delta correlation vs mean firing rate (per cell).
+
+    For each folder in `cell_folders`, this loads two corrDict*.pkl files:
+      - smoothing A: (fr_sig_a, cal_sig_a)
+      - smoothing B: (fr_sig_b, cal_sig_b)
+
+    It computes:
+      - r_a, r_b from corrDict["pearson_r"]
+      - mean_fr_a, mean_fr_b from mean(corrDict["fr_on_ca"])
+      - mean_fr = (mean_fr_a + mean_fr_b) / 2
+      - delta_r = r_a - r_b (or reversed via `delta_order`)
+
+    Returns: (fig, df)
+      - fig: plotly.graph_objects.Figure
+      - df: pandas.DataFrame with per-cell values and file paths
+    """
+    import glob
+    import os
+
+    def _sig_to_str(x):
+        try:
+            return f"{float(x):g}"
+        except Exception:
+            return str(x)
+
+    def _load_corrdict(path):
+        with open(path, "rb") as f:
+            return pickle.load(f)
+
+    def _score_candidate(d, fr_target, cal_target):
+        params = d.get("params", {}) if isinstance(d, dict) else {}
+        fr = params.get("fr_smooth_sigma_s", None)
+        cal = params.get("ca_smooth_sigma_s", None)
+        try:
+            fr = float(fr)
+            cal = float(cal)
+        except Exception:
+            return np.inf
+        return abs(fr - fr_target) + abs(cal - cal_target)
+
+    def _find_corrdict_for_sig(folder, fr_sig, cal_sig):
+        fr_s = _sig_to_str(fr_sig)
+        cal_s = _sig_to_str(cal_sig)
+        exact = glob.glob(os.path.join(folder, f"corrDict*_frSm{fr_s}_calSm{cal_s}.pkl"))
+        if len(exact) > 0:
+            return sorted(exact)[0]
+
+        # Fallback: scan and pick nearest using corrDict["params"].
+        candidates = glob.glob(os.path.join(folder, "corrDict*_frSm*_calSm*.pkl"))
+        best_path = None
+        best_score = np.inf
+        for p in candidates:
+            try:
+                d = _load_corrdict(p)
+            except Exception:
+                continue
+            s = _score_candidate(d, float(fr_sig), float(cal_sig))
+            if s < best_score:
+                best_score = s
+                best_path = p
+        return best_path
+
+    if isinstance(cell_folders, dict):
+        items = list(cell_folders.items())
+    else:
+        items = [(None, p) for p in list(cell_folders)]
+
+    rows = []
+    for provided_label, folder in items:
+        if folder is None:
+            continue
+
+        if label_from == "provided" and provided_label is not None:
+            label = str(provided_label)
+        elif label_from == "basename":
+            label = os.path.basename(os.path.normpath(str(folder)))
+        else:
+            label = str(provided_label) if provided_label is not None else str(folder)
+
+        p_a = _find_corrdict_for_sig(folder, fr_sig_a, cal_sig_a)
+        p_b = _find_corrdict_for_sig(folder, fr_sig_b, cal_sig_b)
+        if not p_a or not p_b:
+            continue
+
+        try:
+            d_a = _load_corrdict(p_a)
+            d_b = _load_corrdict(p_b)
+        except Exception:
+            continue
+
+        r_a = d_a.get("pearson_r", np.nan)
+        r_b = d_b.get("pearson_r", np.nan)
+        try:
+            r_a = float(r_a)
+        except Exception:
+            r_a = np.nan
+        try:
+            r_b = float(r_b)
+        except Exception:
+            r_b = np.nan
+
+        fr_a = np.asarray(d_a.get("fr_on_ca", np.array([])), float).ravel()
+        fr_b = np.asarray(d_b.get("fr_on_ca", np.array([])), float).ravel()
+        mean_fr_a = float(np.nanmean(fr_a)) if fr_a.size else np.nan
+        mean_fr_b = float(np.nanmean(fr_b)) if fr_b.size else np.nan
+        mean_fr = float(np.nanmean([mean_fr_a, mean_fr_b]))
+
+        if delta_order == "a_minus_b":
+            delta_r = r_a - r_b
+        elif delta_order == "b_minus_a":
+            delta_r = r_b - r_a
+        else:
+            raise ValueError("delta_order must be 'a_minus_b' or 'b_minus_a'")
+
+        rows.append(
+            dict(
+                label=label,
+                folder=str(folder),
+                fr_sig_a=float(fr_sig_a),
+                cal_sig_a=float(cal_sig_a),
+                fr_sig_b=float(fr_sig_b),
+                cal_sig_b=float(cal_sig_b),
+                pearson_r_a=r_a,
+                pearson_r_b=r_b,
+                delta_pearson_r=float(delta_r) if np.isfinite(delta_r) else np.nan,
+                mean_fr_a=mean_fr_a,
+                mean_fr_b=mean_fr_b,
+                mean_fr=mean_fr,
+                path_a=str(p_a),
+                path_b=str(p_b),
+            )
+        )
+
+    df = pd.DataFrame(rows)
+    if len(df) == 0:
+        fig = go.Figure()
+        fig.update_layout(
+            template="plotly_white",
+            title=title or "Δ correlation vs mean FR (no valid cells found)",
+            xaxis_title="Mean FR (Hz)",
+            yaxis_title="Δ Pearson r",
+        )
+        return fig, df
+
+    m = np.isfinite(df["mean_fr"].to_numpy(float)) & np.isfinite(df["delta_pearson_r"].to_numpy(float))
+    dff = df.loc[m].copy()
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=dff["mean_fr"],
+            y=dff["delta_pearson_r"],
+            mode="markers",
+            text=dff["label"],
+            hovertemplate="cell=%{text}<br>mean_fr=%{x:.3g}<br>Δr=%{y:.3g}<extra></extra>",
+            marker=dict(size=marker_size),
+        )
+    )
+    fig.add_hline(y=0, line_width=1, line_dash="dash", line_color="gray")
+
+    if title is None:
+        order_txt = "r(a)-r(b)" if delta_order == "a_minus_b" else "r(b)-r(a)"
+        title = (
+            f"Δ Pearson correlation vs mean FR | "
+            f"A(fr={_sig_to_str(fr_sig_a)}, cal={_sig_to_str(cal_sig_a)}) "
+            f"B(fr={_sig_to_str(fr_sig_b)}, cal={_sig_to_str(cal_sig_b)}) | {order_txt}"
+        )
+
+    fig.update_layout(
+        template="plotly_white",
+        title=title,
+        xaxis_title="Mean FR (Hz) (mean of mean(fr_on_ca) in A and B)",
+        yaxis_title="Δ Pearson r",
+    )
+
+    if save_html:
+        fig.write_html(str(save_html), include_plotlyjs="cdn")
+    if save_svg:
+        try:
+            fig.write_image(str(save_svg), format="svg")
+        except Exception as e:
+            print("⚠️ SVG export failed (likely missing kaleido). Install: pip install -U kaleido")
+            print("   Error:", e)
+
+    if show:
+        fig.show()
+
+    return fig, df
+
+
+def plot_corr_two_smoothing_connected(
+    cell_folders,
+    *,
+    fr_sig_a=0.01,
+    cal_sig_a=0.01,
+    fr_sig_b=1.5,
+    cal_sig_b=1.5,
+    label_from="basename",
+    title=None,
+    marker_size=8,
+    line_width=1,
+    line_opacity=0.35,
+    save_html=None,
+    save_svg=None,
+    show=True,
+):
+    """
+    Paired-dot plot with connecting lines: corr in smoothing A vs smoothing B (per cell).
+
+    Each cell is one line from:
+      - x=0: pearson_r at (fr_sig_a, cal_sig_a)
+      - x=1: pearson_r at (fr_sig_b, cal_sig_b)
+
+    corrDict values are read from corrDict*.pkl files in each cell folder.
+
+    Returns: (fig, df)
+      - fig: plotly.graph_objects.Figure
+      - df: pandas.DataFrame with per-cell correlations and file paths
+    """
+    # Reuse the loader logic from plot_delta_corr_vs_mean_fr to get a consistent df.
+    _, df = plot_delta_corr_vs_mean_fr(
+        cell_folders,
+        fr_sig_a=fr_sig_a,
+        cal_sig_a=cal_sig_a,
+        fr_sig_b=fr_sig_b,
+        cal_sig_b=cal_sig_b,
+        delta_order="a_minus_b",
+        label_from=label_from,
+        title=None,
+        show=False,
+    )
+
+    if df is None or len(df) == 0:
+        fig = go.Figure()
+        fig.update_layout(
+            template="plotly_white",
+            title=title or "Correlation in two smoothing conditions (no valid cells found)",
+            xaxis_title="Smoothing",
+            yaxis_title="Pearson r",
+        )
+        return fig, df
+
+    r_a = df["pearson_r_a"].to_numpy(float)
+    r_b = df["pearson_r_b"].to_numpy(float)
+    ok = np.isfinite(r_a) & np.isfinite(r_b)
+    dff = df.loc[ok].copy()
+
+    if len(dff) == 0:
+        fig = go.Figure()
+        fig.update_layout(
+            template="plotly_white",
+            title=title or "Correlation in two smoothing conditions (no finite r pairs)",
+            xaxis_title="Smoothing",
+            yaxis_title="Pearson r",
+        )
+        return fig, df
+
+    x0 = np.zeros(len(dff), dtype=float)
+    x1 = np.ones(len(dff), dtype=float)
+    y0 = dff["pearson_r_a"].to_numpy(float)
+    y1 = dff["pearson_r_b"].to_numpy(float)
+
+    # Build a single trace with line segments separated by None.
+    x_lines = np.empty(len(dff) * 3, dtype=object)
+    y_lines = np.empty(len(dff) * 3, dtype=object)
+    x_lines[0::3] = 0
+    x_lines[1::3] = 1
+    x_lines[2::3] = None
+    y_lines[0::3] = y0
+    y_lines[1::3] = y1
+    y_lines[2::3] = None
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Scatter(
+            x=x_lines,
+            y=y_lines,
+            mode="lines",
+            line=dict(color=f"rgba(120,120,120,{line_opacity})", width=line_width),
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=x0,
+            y=y0,
+            mode="markers",
+            name=f"fr={fr_sig_a:g}, ca={cal_sig_a:g}",
+            text=dff["label"],
+            hovertemplate="cell=%{text}<br>r=%{y:.3g}<extra></extra>",
+            marker=dict(size=marker_size),
+        )
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=x1,
+            y=y1,
+            mode="markers",
+            name=f"fr={fr_sig_b:g}, ca={cal_sig_b:g}",
+            text=dff["label"],
+            hovertemplate="cell=%{text}<br>r=%{y:.3g}<extra></extra>",
+            marker=dict(size=marker_size),
+        )
+    )
+
+    if title is None:
+        title = (
+            f"Pearson correlation per cell | "
+            f"(fr,ca)=({fr_sig_a:g},{cal_sig_a:g}) vs ({fr_sig_b:g},{cal_sig_b:g})"
+        )
+
+    fig.update_layout(
+        template="plotly_white",
+        title=title,
+        xaxis=dict(
+            tickmode="array",
+            tickvals=[0, 1],
+            ticktext=[f"({fr_sig_a:g},{cal_sig_a:g})", f"({fr_sig_b:g},{cal_sig_b:g})"],
+            title="Smoothing (fr_sigma_s, ca_sigma_s)",
+        ),
+        yaxis=dict(title="Pearson r"),
+    )
+
+    if save_html:
+        fig.write_html(str(save_html), include_plotlyjs="cdn")
+    if save_svg:
+        try:
+            fig.write_image(str(save_svg), format="svg")
+        except Exception as e:
+            print("⚠️ SVG export failed (likely missing kaleido). Install: pip install -U kaleido")
+            print("   Error:", e)
+
+    if show:
+        fig.show()
+
+    return fig, df
+
+
+def plot_corr_multi_smoothing_connected(
+    cell_folders,
+    sig_pairs=None,
+    *,
+    sigmas=None,
+    label_from="basename",
+    require_all=True,
+    title=None,
+    marker_size=8,
+    line_width=1,
+    line_opacity=0.35,
+    save_html=None,
+    save_svg=None,
+    show=True,
+):
+    """
+    Multi-column paired-dot plot with connecting lines across smoothing conditions.
+
+    Provide either:
+      - sig_pairs: list of (fr_sigma_s, ca_sigma_s) tuples
+      - sigmas: list of sigma values; uses diagonal pairs (s, s)
+
+    For each cell folder, loads corrDict*.pkl matching each condition and reads:
+      - corrDict["pearson_r"]
+
+    Plot:
+      - One column per condition.
+      - Each cell is a polyline through its dots across all columns.
+
+    Returns: (fig, df)
+      - fig: plotly.graph_objects.Figure
+      - df: pandas.DataFrame with one row per cell and r/path per condition.
+    """
+    import os
+    import glob
+    import re
+
+    if sig_pairs is None:
+        if sigmas is None:
+            raise ValueError("Provide sig_pairs=[(fr,cal), ...] or sigmas=[s1,s2,...]")
+        sig_pairs = [(float(s), float(s)) for s in sigmas]
+    else:
+        sig_pairs = [(float(a), float(b)) for (a, b) in sig_pairs]
+
+    if len(sig_pairs) < 2:
+        raise ValueError("Need at least 2 smoothing conditions")
+
+    _PAT = re.compile(r"corrDict.*_frSm(?P<fr>\d+(?:\.\d+)?)_calSm(?P<cal>\d+(?:\.\d+)?)\.pkl$", re.IGNORECASE)
+
+    def _sig_to_str(x):
+        return f"{float(x):g}"
+
+    def _parse_from_name(p):
+        m = _PAT.search(os.path.basename(p))
+        if not m:
+            return None
+        try:
+            return float(m.group("fr")), float(m.group("cal"))
+        except Exception:
+            return None
+
+    def _find_best_file(folder, fr_sig, cal_sig):
+        # 1) exact by common formatting
+        fr_s = _sig_to_str(fr_sig)
+        cal_s = _sig_to_str(cal_sig)
+        exact = glob.glob(os.path.join(folder, f"corrDict*_frSm{fr_s}_calSm{cal_s}.pkl"))
+        if len(exact) > 0:
+            return sorted(exact)[0]
+
+        # 2) nearest by parsing filename (fast)
+        candidates = glob.glob(os.path.join(folder, "corrDict*_frSm*_calSm*.pkl"))
+        best_p = None
+        best_score = np.inf
+        for p in candidates:
+            parsed = _parse_from_name(p)
+            if parsed is None:
+                continue
+            fr0, cal0 = parsed
+            s = abs(fr0 - fr_sig) + abs(cal0 - cal_sig)
+            if s < best_score:
+                best_score = s
+                best_p = p
+        if best_p is not None:
+            return best_p
+
+        # 3) brute fallback
+        any_p = glob.glob(os.path.join(folder, "corrDict*.pkl"))
+        return sorted(any_p)[0] if len(any_p) else None
+
+    def _load_r(pkl_path):
+        with open(pkl_path, "rb") as f:
+            d = pickle.load(f)
+        r = d.get("pearson_r", np.nan)
+        try:
+            return float(r)
+        except Exception:
+            return np.nan
+
+    if isinstance(cell_folders, dict):
+        items = list(cell_folders.items())
+    else:
+        items = [(None, p) for p in list(cell_folders)]
+
+    rows = []
+    for provided_label, folder in items:
+        if folder is None:
+            continue
+
+        if label_from == "provided" and provided_label is not None:
+            label = str(provided_label)
+        elif label_from == "basename":
+            label = os.path.basename(os.path.normpath(str(folder)))
+        else:
+            label = str(provided_label) if provided_label is not None else str(folder)
+
+        r_vals = []
+        p_vals = []
+        for (fr_sig, cal_sig) in sig_pairs:
+            p = _find_best_file(folder, fr_sig, cal_sig)
+            if not p:
+                r_vals.append(np.nan)
+                p_vals.append(None)
+                continue
+            try:
+                r = _load_r(p)
+            except Exception:
+                r = np.nan
+            r_vals.append(r)
+            p_vals.append(p)
+
+        row = {"label": label, "folder": str(folder), "r_list": r_vals, "path_list": p_vals}
+        for j, (fr_sig, cal_sig) in enumerate(sig_pairs):
+            row[f"r_{j}"] = r_vals[j]
+            row[f"path_{j}"] = p_vals[j]
+            row[f"fr_sig_{j}"] = fr_sig
+            row[f"cal_sig_{j}"] = cal_sig
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    if len(df) == 0:
+        fig = go.Figure()
+        fig.update_layout(
+            template="plotly_white",
+            title=title or "Correlation across smoothing conditions (no valid cells found)",
+            xaxis_title="Smoothing",
+            yaxis_title="Pearson r",
+        )
+        return fig, df
+
+    rmat = np.vstack([np.asarray(x, float) for x in df["r_list"].to_list()])
+    if require_all:
+        ok = np.isfinite(rmat).all(axis=1)
+    else:
+        ok = np.isfinite(rmat).any(axis=1)
+
+    dff = df.loc[ok].copy()
+    if len(dff) == 0:
+        fig = go.Figure()
+        fig.update_layout(
+            template="plotly_white",
+            title=title or "Correlation across smoothing conditions (no cells with required data)",
+            xaxis_title="Smoothing",
+            yaxis_title="Pearson r",
+        )
+        return fig, df
+
+    rmat = np.vstack([np.asarray(x, float) for x in dff["r_list"].to_list()])
+    n_cells = rmat.shape[0]
+    k = rmat.shape[1]
+
+    x_ticks = np.arange(k, dtype=float)
+    tick_text = [f"({fr:g},{cal:g})" for (fr, cal) in sig_pairs]
+
+    # Connection lines (one trace)
+    x_lines = []
+    y_lines = []
+    for i in range(n_cells):
+        y = rmat[i, :]
+        if require_all:
+            x_lines.extend(list(x_ticks) + [None])
+            y_lines.extend(list(y) + [None])
+        else:
+            # break at NaNs
+            for j in range(k):
+                if np.isfinite(y[j]):
+                    x_lines.append(float(x_ticks[j]))
+                    y_lines.append(float(y[j]))
+                else:
+                    x_lines.append(None)
+                    y_lines.append(None)
+            x_lines.append(None)
+            y_lines.append(None)
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=x_lines,
+            y=y_lines,
+            mode="lines",
+            line=dict(color=f"rgba(120,120,120,{line_opacity})", width=line_width),
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+
+    # Dots per column
+    colors = [
+        "#1f77b4",
+        "#ff7f0e",
+        "#2ca02c",
+        "#d62728",
+        "#9467bd",
+        "#8c564b",
+        "#e377c2",
+        "#7f7f7f",
+        "#bcbd22",
+        "#17becf",
+    ]
+
+    for j in range(k):
+        y = rmat[:, j]
+        x = np.full(n_cells, float(j))
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=y,
+                mode="markers",
+                name=tick_text[j],
+                text=dff["label"],
+                hovertemplate="cell=%{text}<br>r=%{y:.3g}<extra></extra>",
+                marker=dict(size=marker_size, color=colors[j % len(colors)]),
+            )
+        )
+
+    if title is None:
+        title = "Pearson correlation per cell across smoothing conditions"
+
+    fig.update_layout(
+        template="plotly_white",
+        title=title,
+        xaxis=dict(
+            tickmode="array",
+            tickvals=list(x_ticks),
+            ticktext=tick_text,
+            title="Smoothing (fr_sigma_s, ca_sigma_s)",
+        ),
+        yaxis=dict(title="Pearson r"),
+    )
+
+    if save_html:
+        out_dir = os.path.dirname(str(save_html))
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        fig.write_html(str(save_html), include_plotlyjs="cdn")
+    if save_svg:
+        out_dir = os.path.dirname(str(save_svg))
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        try:
+            fig.write_image(str(save_svg), format="svg")
+        except Exception as e:
+            print("⚠️ SVG export failed (likely missing kaleido). Install: pip install -U kaleido")
+            print("   Error:", e)
+
+    if show:
+        fig.show()
+
+    return fig, df
+
+
+def plot_corr_multi_smoothing_connected_open_folder(
+    cell_folders,
+    sig_pairs=None,
+    *,
+    sigmas=None,
+    label_from="basename",
+    require_all=True,
+    title=None,
+    marker_size=8,
+    line_width=1,
+    line_opacity=0.35,
+    save_html=None,
+    save_svg=None,
+    show=True,
+    open_on_click_notebook=True,
+):
+    """
+    Same as plot_corr_multi_smoothing_connected(), but clicking a cell dot opens that cell folder.
+
+    - In notebooks (VSCode/Jupyter): if open_on_click_notebook=True, returns a FigureWidget with a Python
+      click-handler that calls os.startfile(folder).
+    - In saved HTML: embeds a plotly_click JS handler that tries to open the folder via a file:// URI.
+      (Browser security policies may block this; it will then show a prompt with the URI.)
+
+    Returns: (fig_or_widget, df)
+    """
+    import os
+    from pathlib import Path
+    import plotly.io as pio
+
+    fig, df = plot_corr_multi_smoothing_connected(
+        cell_folders,
+        sig_pairs=sig_pairs,
+        sigmas=sigmas,
+        label_from=label_from,
+        require_all=require_all,
+        title=title,
+        marker_size=marker_size,
+        line_width=line_width,
+        line_opacity=line_opacity,
+        save_html=None,
+        save_svg=None,
+        show=False,
+    )
+
+    if df is None or len(df) == 0 or len(fig.data) < 2:
+        if show:
+            fig.show()
+        if save_html:
+            pio.write_html(fig, str(save_html), include_plotlyjs="cdn", full_html=True)
+        if save_svg:
+            try:
+                fig.write_image(str(save_svg), format="svg")
+            except Exception as e:
+                print("⚠️ SVG export failed (likely missing kaleido). Install: pip install -U kaleido")
+                print("   Error:", e)
+        return fig, df
+
+    # Recompute the same dff ordering used by plot_corr_multi_smoothing_connected
+    rmat = np.vstack([np.asarray(x, float) for x in df["r_list"].to_list()])
+    if require_all:
+        ok = np.isfinite(rmat).all(axis=1)
+    else:
+        ok = np.isfinite(rmat).any(axis=1)
+    dff = df.loc[ok].copy()
+
+    # Replace gray lines with colored segments
+    rmat_colored = np.vstack([np.asarray(x, float) for x in dff["r_list"].to_list()])
+    n_cells_colored = rmat_colored.shape[0]
+    k_colored = rmat_colored.shape[1]
+    x_ticks_colored = np.arange(k_colored, dtype=float)
+
+    # Remove the first trace (gray lines)
+    fig.data = fig.data[1:]
+
+    # Add colored segments
+    def get_color(delta):
+        if delta <= -0.1:
+            return 'lightblue'
+        elif delta <= 0.2:
+            return 'yellow'
+        else:
+            return 'green'
+
+    x_segments = {'lightblue': [], 'yellow': [], 'green': []}
+    y_segments = {'lightblue': [], 'yellow': [], 'green': []}
+
+    for i in range(n_cells_colored):
+        y = rmat_colored[i, :]
+        for j in range(k_colored - 1):
+            if np.isfinite(y[j]) and np.isfinite(y[j + 1]):
+                delta = y[j + 1] - y[j]
+                color = get_color(delta)
+                x_segments[color].extend([x_ticks_colored[j], x_ticks_colored[j + 1], None])
+                y_segments[color].extend([y[j], y[j + 1], None])
+
+    for color in ['lightblue', 'yellow', 'green']:
+        if x_segments[color]:
+            fig.add_trace(
+                go.Scatter(
+                    x=x_segments[color],
+                    y=y_segments[color],
+                    mode="lines",
+                    line=dict(color=color, width=line_width),
+                    hoverinfo="skip",
+                    showlegend=False,
+                )
+            )
+
+    def _to_file_uri(p):
+        try:
+            return Path(str(p)).absolute().as_uri()
+        except Exception:
+            # fallback: best-effort conversion
+            s = str(p).replace("\\", "/")
+            if len(s) >= 2 and s[1] == ":":
+                return "file:///" + s
+            return s
+
+    folders_raw = dff["folder"].astype(str).to_list()
+    folders_uri = [_to_file_uri(p) for p in folders_raw]
+    customdata = np.array(list(zip(folders_raw, folders_uri)), dtype=object)
+
+    # Trace 0 is the connecting lines; traces 1..k are marker columns.
+    for tr in fig.data[1:]:
+        try:
+            if getattr(tr, "mode", "") and "markers" in tr.mode:
+                tr.customdata = customdata
+                tr.hovertemplate = (
+                    "cell=%{text}<br>r=%{y:.3g}<br>folder=%{customdata[0]}<extra></extra>"
+                )
+        except Exception:
+            pass
+
+    # Save HTML with JS click handler
+    if save_html:
+        out_dir = os.path.dirname(str(save_html))
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        post_script = r"""
+var plot = document.getElementById('{plot_id}');
+if (plot) {
+  plot.on('plotly_click', function(data) {
+    try {
+      if (!data || !data.points || !data.points.length) return;
+      var cd = data.points[0].customdata;
+      var url = null;
+      if (cd && cd.length && cd.length > 1) url = cd[1];
+      else url = cd;
+      if (!url) return;
+      var w = window.open(url, '_blank');
+      if (!w) {
+        // popup blocked or file URIs blocked
+        window.location.href = url;
+      }
+    } catch (e) {
+      try {
+        var cd2 = data.points[0].customdata;
+        var url2 = (cd2 && cd2.length && cd2.length > 1) ? cd2[1] : cd2;
+        window.prompt('Open/copy folder URI:', url2);
+      } catch (e2) {}
+    }
+  });
+}
+"""
+        pio.write_html(fig, str(save_html), include_plotlyjs="cdn", full_html=True, post_script=post_script)
+
+    if save_svg:
+        out_dir = os.path.dirname(str(save_svg))
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        try:
+            fig.write_image(str(save_svg), format="svg")
+        except Exception as e:
+            print("⚠️ SVG export failed (likely missing kaleido). Install: pip install -U kaleido")
+            print("   Error:", e)
+
+    if open_on_click_notebook:
+        try:
+            from plotly.graph_objs import FigureWidget
+            figw = FigureWidget(fig)
+
+            def _open_folder(trace, points, state):
+                if points is None or len(getattr(points, "point_inds", [])) == 0:
+                    return
+                i = int(points.point_inds[0])
+                try:
+                    cd = trace.customdata[i]
+                    folder = cd[0] if isinstance(cd, (list, tuple, np.ndarray)) else cd
+                except Exception:
+                    folder = folders_raw[i] if i < len(folders_raw) else None
+                if folder:
+                    try:
+                        os.startfile(folder)
+                    except Exception as e:
+                        print("⚠️ Could not open folder:", folder)
+                        print("   Error:", e)
+
+            for tr in figw.data[1:]:
+                try:
+                    if getattr(tr, "mode", "") and "markers" in tr.mode:
+                        tr.on_click(_open_folder)
+                except Exception:
+                    pass
+
+            if show:
+                try:
+                    from IPython.display import display
+                    display(figw)
+                except Exception:
+                    figw.show()
+            return figw, df
+        except Exception:
+            pass
+
+    if show:
+        fig.show()
+    return fig, df
+
+
+
+def plot_delta_corr_steps_connected_open_folder(
+    cell_folders,
+    sig_pairs=None,
+    *,
+    sigmas=None,
+    label_from="basename",
+    require_all=True,
+    title=None,
+    marker_size=8,
+    line_width=1,
+    line_opacity=0.35,
+    save_html=None,
+    save_svg=None,
+    show=True,
+    open_on_click_notebook=True,
+):
+    """
+    Multi-column plot of delta-correlation steps with clickable dots.
+
+    Given smoothing conditions (sig_pairs or sigmas diagonal), compute per-cell Pearson r at each
+    condition, then plot deltas between consecutive conditions:
+
+      delta_j = r_{j+1} - r_j
+
+    Example conditions:
+      [(0.01,0.01), (0.15,0.15), (0.45,0.45), (1.5,1.5), (3,3)]
+
+    Produces k-1 columns (one per consecutive delta). Each cell is a polyline across columns.
+
+    Clicking any dot opens the corresponding cell folder:
+      - Notebook: uses os.startfile
+      - Saved HTML: tries to open file:/// URI (may be blocked by browser policies)
+
+    Returns: (fig_or_widget, df)
+      - df contains r_list and delta_list.
+    """
+    import os
+    from pathlib import Path
+    import plotly.io as pio
+
+    # Build/load r_list consistently using the existing loader.
+    _fig_unused, df = plot_corr_multi_smoothing_connected(
+        cell_folders,
+        sig_pairs=sig_pairs,
+        sigmas=sigmas,
+        label_from=label_from,
+        require_all=False,  # we will filter ourselves for deltas
+        title=None,
+        marker_size=marker_size,
+        line_width=line_width,
+        line_opacity=line_opacity,
+        save_html=None,
+        save_svg=None,
+        show=False,
+    )
+
+    if df is None or len(df) == 0:
+        fig = go.Figure()
+        fig.update_layout(
+            template="plotly_white",
+            title=title or "Δ Pearson r between consecutive smoothing (no valid cells found)",
+            xaxis_title="Δ between smoothing conditions",
+            yaxis_title="Δ Pearson r",
+        )
+        return fig, df
+
+    # Recover the sig_pairs used in plot_corr_multi_smoothing_connected (stored per-row as fr_sig_*/cal_sig_*).
+    sig_pairs_used = []
+    idx = 0
+    while f"fr_sig_{idx}" in df.columns and f"cal_sig_{idx}" in df.columns:
+        try:
+            sig_pairs_used.append((float(df[f"fr_sig_{idx}"].iloc[0]), float(df[f"cal_sig_{idx}"].iloc[0])))
+        except Exception:
+            break
+        idx += 1
+
+    if len(sig_pairs_used) < 2:
+        raise ValueError("Need at least 2 smoothing conditions to compute deltas")
+
+    rmat = np.vstack([np.asarray(x, float) for x in df["r_list"].to_list()])
+    delta_mat = rmat[:, 1:] - rmat[:, :-1]
+
+    if require_all:
+        ok = np.isfinite(delta_mat).all(axis=1)
+    else:
+        ok = np.isfinite(delta_mat).any(axis=1)
+
+    dff = df.loc[ok].copy()
+    if len(dff) == 0:
+        fig = go.Figure()
+        fig.update_layout(
+            template="plotly_white",
+            title=title or "Δ Pearson r between consecutive smoothing (no cells with required data)",
+            xaxis_title="Δ between smoothing conditions",
+            yaxis_title="Δ Pearson r",
+        )
+        return fig, df
+
+    rmat = np.vstack([np.asarray(x, float) for x in dff["r_list"].to_list()])
+    delta_mat = rmat[:, 1:] - rmat[:, :-1]
+
+    # Add delta_list + columns to dff/df for convenience
+    dff["delta_list"] = [row.tolist() for row in delta_mat]
+    for j in range(delta_mat.shape[1]):
+        dff[f"delta_{j}"] = delta_mat[:, j]
+
+    k_minus_1 = delta_mat.shape[1]
+    x_ticks = np.arange(k_minus_1, dtype=float)
+
+    tick_text = []
+    for j in range(k_minus_1):
+        fr0, cal0 = sig_pairs_used[j]
+        fr1, cal1 = sig_pairs_used[j + 1]
+        tick_text.append(f"Δ({fr1:g},{cal1:g})-({fr0:g},{cal0:g})")
+
+    def _to_file_uri(p):
+        try:
+            return Path(str(p)).absolute().as_uri()
+        except Exception:
+            s = str(p).replace("\\", "/")
+            if len(s) >= 2 and s[1] == ":":
+                return "file:///" + s
+            return s
+
+    folders_raw = dff["folder"].astype(str).to_list()
+    folders_uri = [_to_file_uri(p) for p in folders_raw]
+    customdata = np.array(list(zip(folders_raw, folders_uri)), dtype=object)
+
+    # Connection lines (one trace)
+    x_lines = []
+    y_lines = []
+    for i in range(delta_mat.shape[0]):
+        y = delta_mat[i, :]
+        if require_all:
+            x_lines.extend(list(x_ticks) + [None])
+            y_lines.extend(list(y) + [None])
+        else:
+            for j in range(k_minus_1):
+                if np.isfinite(y[j]):
+                    x_lines.append(float(x_ticks[j]))
+                    y_lines.append(float(y[j]))
+                else:
+                    x_lines.append(None)
+                    y_lines.append(None)
+            x_lines.append(None)
+            y_lines.append(None)
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=x_lines,
+            y=y_lines,
+            mode="lines",
+            line=dict(color=f"rgba(120,120,120,{line_opacity})", width=line_width),
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+
+    # Dots per delta-column
+    colors = [
+        "#1f77b4",
+        "#ff7f0e",
+        "#2ca02c",
+        "#d62728",
+        "#9467bd",
+        "#8c564b",
+        "#e377c2",
+        "#7f7f7f",
+        "#bcbd22",
+        "#17becf",
+    ]
+
+    labels = dff["label"]
+    for j in range(k_minus_1):
+        y = delta_mat[:, j]
+        x = np.full(delta_mat.shape[0], float(j))
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=y,
+                mode="markers",
+                name=tick_text[j],
+                text=labels,
+                customdata=customdata,
+                hovertemplate=(
+                    "cell=%{text}<br>Δr=%{y:.3g}<br>folder=%{customdata[0]}<extra></extra>"
+                ),
+                marker=dict(size=marker_size, color=colors[j % len(colors)]),
+            )
+        )
+
+    if title is None:
+        title = "Δ Pearson r between consecutive smoothing conditions (per cell)"
+
+    fig.update_layout(
+        template="plotly_white",
+        title=title,
+        xaxis=dict(
+            tickmode="array",
+            tickvals=list(x_ticks),
+            ticktext=tick_text,
+            title="Δ between consecutive (fr_sigma_s, ca_sigma_s)",
+        ),
+        yaxis=dict(title="Δ Pearson r (r_next - r_prev)"),
+    )
+
+    # Save HTML with JS click handler
+    if save_html:
+        out_dir = os.path.dirname(str(save_html))
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        post_script = r"""
+var plot = document.getElementById('{plot_id}');
+if (plot) {
+  plot.on('plotly_click', function(data) {
+    try {
+      if (!data || !data.points || !data.points.length) return;
+      var cd = data.points[0].customdata;
+      var url = null;
+      if (cd && cd.length && cd.length > 1) url = cd[1];
+      else url = cd;
+      if (!url) return;
+      var w = window.open(url, '_blank');
+      if (!w) {
+        window.location.href = url;
+      }
+    } catch (e) {
+      try {
+        var cd2 = data.points[0].customdata;
+        var url2 = (cd2 && cd2.length && cd2.length > 1) ? cd2[1] : cd2;
+        window.prompt('Open/copy folder URI:', url2);
+      } catch (e2) {}
+    }
+  });
+}
+"""
+        pio.write_html(fig, str(save_html), include_plotlyjs="cdn", full_html=True, post_script=post_script)
+
+    if save_svg:
+        out_dir = os.path.dirname(str(save_svg))
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        try:
+            fig.write_image(str(save_svg), format="svg")
+        except Exception as e:
+            print("⚠️ SVG export failed (likely missing kaleido). Install: pip install -U kaleido")
+            print("   Error:", e)
+
+    if open_on_click_notebook:
+        try:
+            from plotly.graph_objs import FigureWidget
+
+            figw = FigureWidget(fig)
+
+            def _open_folder(trace, points, state):
+                if points is None or len(getattr(points, "point_inds", [])) == 0:
+                    return
+                i = int(points.point_inds[0])
+                try:
+                    cd = trace.customdata[i]
+                    folder = cd[0] if isinstance(cd, (list, tuple, np.ndarray)) else cd
+                except Exception:
+                    folder = folders_raw[i] if i < len(folders_raw) else None
+                if folder:
+                    try:
+                        os.startfile(folder)
+                    except Exception as e:
+                        print("⚠️ Could not open folder:", folder)
+                        print("   Error:", e)
+
+            for tr in figw.data[1:]:
+                try:
+                    if getattr(tr, "mode", "") and "markers" in tr.mode:
+                        tr.on_click(_open_folder)
+                except Exception:
+                    pass
+
+            if show:
+                try:
+                    from IPython.display import display
+
+                    display(figw)
+                except Exception:
+                    figw.show()
+
+            # Return a df that includes delta_list/columns
+            return figw, dff
+        except Exception:
+            pass
+
+    if show:
+        fig.show()
+
+    return fig, dff
+
+
+# --- override: add click-to-open-folder support ---
+
+def plot_delta_corr_vs_mean_fr(
+    cell_folders,
+    *,
+    fr_sig_a=0.01,
+    cal_sig_a=0.01,
+    fr_sig_b=1.5,
+    cal_sig_b=1.5,
+    delta_order="a_minus_b",
+    label_from="basename",
+    title=None,
+    marker_size=8,
+    save_html=None,
+    save_svg=None,
+    show=True,
+    open_on_click_notebook=False,
+    open_on_click_html=False,
+):
+    """Scatter plot: delta correlation vs mean firing rate (per cell).
+
+    Computes per-cell:
+      - r_a, r_b from corrDict["pearson_r"]
+      - mean_fr_a, mean_fr_b from mean(corrDict["fr_on_ca"])
+      - mean_fr = (mean_fr_a + mean_fr_b) / 2
+      - delta_r = r_a - r_b (or reversed via `delta_order`)
+
+    Click behavior:
+      - Notebook: if open_on_click_notebook=True, returns a FigureWidget; clicking a point opens the
+        cell folder via os.startfile.
+      - Saved HTML: if open_on_click_html=True and save_html is set, embeds a JS click handler that
+        tries to open the folder file:/// URI (may be blocked by browser policies).
+
+    Returns: (fig_or_widget, df)
+    """
+    import glob
+    import os
+    from pathlib import Path
+    import plotly.io as pio
+
+    def _sig_to_str(x):
+        try:
+            return f"{float(x):g}"
+        except Exception:
+            return str(x)
+
+    def _to_file_uri(p):
+        try:
+            return Path(str(p)).absolute().as_uri()
+        except Exception:
+            s = str(p).replace("\\", "/")
+            if len(s) >= 2 and s[1] == ":":
+                return "file:///" + s
+            return s
+
+    def _load_corrdict(path):
+        with open(path, "rb") as f:
+            return pickle.load(f)
+
+    def _score_candidate(d, fr_target, cal_target):
+        params = d.get("params", {}) if isinstance(d, dict) else {}
+        fr = params.get("fr_smooth_sigma_s", None)
+        cal = params.get("ca_smooth_sigma_s", None)
+        try:
+            fr = float(fr)
+            cal = float(cal)
+        except Exception:
+            return np.inf
+        return abs(fr - fr_target) + abs(cal - cal_target)
+
+    def _find_corrdict_for_sig(folder, fr_sig, cal_sig):
+        fr_s = _sig_to_str(fr_sig)
+        cal_s = _sig_to_str(cal_sig)
+        exact = glob.glob(os.path.join(folder, f"corrDict*_frSm{fr_s}_calSm{cal_s}.pkl"))
+        if len(exact) > 0:
+            return sorted(exact)[0]
+
+        # Fallback: scan and pick nearest using corrDict["params"].
+        candidates = glob.glob(os.path.join(folder, "corrDict*_frSm*_calSm*.pkl"))
+        best_path = None
+        best_score = np.inf
+        for p in candidates:
+            try:
+                d = _load_corrdict(p)
+            except Exception:
+                continue
+            s = _score_candidate(d, float(fr_sig), float(cal_sig))
+            if s < best_score:
+                best_score = s
+                best_path = p
+        return best_path
+
+    if isinstance(cell_folders, dict):
+        items = list(cell_folders.items())
+    else:
+        items = [(None, p) for p in list(cell_folders)]
+
+    rows = []
+    for provided_label, folder in items:
+        if folder is None:
+            continue
+
+        if label_from == "provided" and provided_label is not None:
+            label = str(provided_label)
+        elif label_from == "basename":
+            label = os.path.basename(os.path.normpath(str(folder)))
+        else:
+            label = str(provided_label) if provided_label is not None else str(folder)
+
+        p_a = _find_corrdict_for_sig(folder, fr_sig_a, cal_sig_a)
+        p_b = _find_corrdict_for_sig(folder, fr_sig_b, cal_sig_b)
+        if not p_a or not p_b:
+            continue
+
+        try:
+            d_a = _load_corrdict(p_a)
+            d_b = _load_corrdict(p_b)
+        except Exception:
+            continue
+
+        r_a = d_a.get("pearson_r", np.nan)
+        r_b = d_b.get("pearson_r", np.nan)
+        try:
+            r_a = float(r_a)
+        except Exception:
+            r_a = np.nan
+        try:
+            r_b = float(r_b)
+        except Exception:
+            r_b = np.nan
+
+        fr_a = np.asarray(d_a.get("fr_on_ca", np.array([])), float).ravel()
+        fr_b = np.asarray(d_b.get("fr_on_ca", np.array([])), float).ravel()
+        mean_fr_a = float(np.nanmean(fr_a)) if fr_a.size else np.nan
+        mean_fr_b = float(np.nanmean(fr_b)) if fr_b.size else np.nan
+        mean_fr = float(np.nanmean([mean_fr_a, mean_fr_b]))
+
+        if delta_order == "a_minus_b":
+            delta_r = r_a - r_b
+        elif delta_order == "b_minus_a":
+            delta_r = r_b - r_a
+        else:
+            raise ValueError("delta_order must be 'a_minus_b' or 'b_minus_a'")
+
+        rows.append(
+            dict(
+                label=label,
+                folder=str(folder),
+                folder_uri=_to_file_uri(folder),
+                fr_sig_a=float(fr_sig_a),
+                cal_sig_a=float(cal_sig_a),
+                fr_sig_b=float(fr_sig_b),
+                cal_sig_b=float(cal_sig_b),
+                pearson_r_a=r_a,
+                pearson_r_b=r_b,
+                delta_pearson_r=float(delta_r) if np.isfinite(delta_r) else np.nan,
+                mean_fr_a=mean_fr_a,
+                mean_fr_b=mean_fr_b,
+                mean_fr=mean_fr,
+                path_a=str(p_a),
+                path_b=str(p_b),
+            )
+        )
+
+    df = pd.DataFrame(rows)
+    if len(df) == 0:
+        fig = go.Figure()
+        fig.update_layout(
+            template="plotly_white",
+            title=title or "Δ correlation vs mean FR (no valid cells found)",
+            xaxis_title="Mean FR (Hz)",
+            yaxis_title="Δ Pearson r",
+        )
+        if show:
+            fig.show()
+        if save_html:
+            out_dir = os.path.dirname(str(save_html))
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            fig.write_html(str(save_html), include_plotlyjs="cdn")
+        if save_svg:
+            out_dir = os.path.dirname(str(save_svg))
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            try:
+                fig.write_image(str(save_svg), format="svg")
+            except Exception as e:
+                print("⚠️ SVG export failed (likely missing kaleido). Install: pip install -U kaleido")
+                print("   Error:", e)
+        return fig, df
+
+    m = np.isfinite(df["mean_fr"].to_numpy(float)) & np.isfinite(df["delta_pearson_r"].to_numpy(float))
+    dff = df.loc[m].copy()
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=dff["mean_fr"],
+            y=dff["delta_pearson_r"],
+            mode="markers",
+            text=dff["label"],
+            customdata=np.array(list(zip(dff["folder"], dff["folder_uri"])), dtype=object),
+            hovertemplate=(
+                "cell=%{text}<br>mean_fr=%{x:.3g}<br>Δr=%{y:.3g}<br>folder=%{customdata[0]}<extra></extra>"
+            ),
+            marker=dict(size=marker_size),
+        )
+    )
+    fig.add_hline(y=0, line_width=1, line_dash="dash", line_color="gray")
+
+    if title is None:
+        order_txt = "r(a)-r(b)" if delta_order == "a_minus_b" else "r(b)-r(a)"
+        title = (
+            f"Δ Pearson correlation vs mean FR | "
+            f"A(fr={_sig_to_str(fr_sig_a)}, cal={_sig_to_str(cal_sig_a)}) "
+            f"B(fr={_sig_to_str(fr_sig_b)}, cal={_sig_to_str(cal_sig_b)}) | {order_txt}"
+        )
+
+    fig.update_layout(
+        template="plotly_white",
+        title=title,
+        xaxis_title="Mean FR (Hz) (mean of mean(fr_on_ca) in A and B)",
+        yaxis_title="Δ Pearson r",
+    )
+
+    if save_html:
+        out_dir = os.path.dirname(str(save_html))
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+
+        if open_on_click_html:
+            post_script = r"""
+var plot = document.getElementById('{plot_id}');
+if (plot) {
+  plot.on('plotly_click', function(data) {
+    try {
+      if (!data || !data.points || !data.points.length) return;
+      var cd = data.points[0].customdata;
+      var url = null;
+      if (cd && cd.length && cd.length > 1) url = cd[1];
+      else url = cd;
+      if (!url) return;
+      var w = window.open(url, '_blank');
+      if (!w) {
+        window.location.href = url;
+      }
+    } catch (e) {
+      try {
+        var cd2 = data.points[0].customdata;
+        var url2 = (cd2 && cd2.length && cd2.length > 1) ? cd2[1] : cd2;
+        window.prompt('Open/copy folder URI:', url2);
+      } catch (e2) {}
+    }
+  });
+}
+"""
+            pio.write_html(fig, str(save_html), include_plotlyjs="cdn", full_html=True, post_script=post_script)
+        else:
+            fig.write_html(str(save_html), include_plotlyjs="cdn")
+
+    if save_svg:
+        out_dir = os.path.dirname(str(save_svg))
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        try:
+            fig.write_image(str(save_svg), format="svg")
+        except Exception as e:
+            print("⚠️ SVG export failed (likely missing kaleido). Install: pip install -U kaleido")
+            print("   Error:", e)
+
+    if open_on_click_notebook:
+        try:
+            from plotly.graph_objs import FigureWidget
+
+            figw = FigureWidget(fig)
+
+            def _open_folder(trace, points, state):
+                if points is None or len(getattr(points, "point_inds", [])) == 0:
+                    return
+                i = int(points.point_inds[0])
+                try:
+                    cd = trace.customdata[i]
+                    folder = cd[0] if isinstance(cd, (list, tuple, np.ndarray)) else cd
+                except Exception:
+                    folder = None
+                if folder:
+                    try:
+                        os.startfile(folder)
+                    except Exception as e:
+                        print("⚠️ Could not open folder:", folder)
+                        print("   Error:", e)
+
+            # first trace is the markers
+            try:
+                figw.data[0].on_click(_open_folder)
+            except Exception:
+                pass
+
+            if show:
+                try:
+                    from IPython.display import display
+
+                    display(figw)
+                except Exception:
+                    figw.show()
+
+            return figw, df
+        except Exception:
+            # fall back to normal figure
+            pass
+
+    if show:
+        fig.show()
+
+    return fig, df

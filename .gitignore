@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.vscode/
+_tmp_cal3_ztest/
+_suite2p_vs_realfr_smoke/
+Pretrained_models/
+*.h5
