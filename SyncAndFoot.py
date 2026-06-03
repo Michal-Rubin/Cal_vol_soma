@@ -635,8 +635,8 @@ if __name__  == "__main__":
                 r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\rugc42\Wh\19-11-2025-awake\fov19',
                 r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\rugc42\Wh\19-11-2025-awake\fov20'
                   ]
-    # DB = pd.read_csv(r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\Dendrites\NewMetaDataSSTgood.csv')
-
+    DB = pd.read_csv(r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\Dendrites\SST_Final.csv')
+    input_folders = list(DB['Link'])
     # values = DB['SNR'].tolist()
     # #r = DB.iloc[[idx for idx,i in enumerate(values) if i > 4.1]]
     # r = DB

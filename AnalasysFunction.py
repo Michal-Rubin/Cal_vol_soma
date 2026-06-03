@@ -367,8 +367,19 @@ def clean_and_parse(x):
         return [] # Return empty list if parsing fails
     
 def motorSp(calT,volT,motorId,calAX,volAX,spId):
-    changePoint =np.argwhere(np.abs(np.diff(motorId)) == 1)
+    # Align motor labels to the working voltage trace length *before* changepoint detection.
+    motorId = np.asarray(motorId, dtype=float).ravel()
     motorId = motorId[0:len(volT)]
+
+    # Build a robust binary copy for changepoint detection:
+    # - fill NaNs so masked holes do not create artificial gaps
+    # - threshold to {0,1}
+    motor_cp = motorId.copy()
+    if motor_cp.size > 0 and np.any(~np.isfinite(motor_cp)):
+        s = pd.Series(motor_cp)
+        motor_cp = s.ffill().bfill().to_numpy(dtype=float)
+    motor_cp = np.where(motor_cp >= 0.5, 1, 0).astype(int, copy=False)
+    changePoint = np.argwhere(np.abs(np.diff(motor_cp)) == 1)
     MotIdx = np.argwhere(motorId == 1).ravel()   # -> 1D array
     RestIdx = np.argwhere(motorId == 0).ravel()  # -> 1D array
     calMotID = []

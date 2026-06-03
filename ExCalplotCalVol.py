@@ -324,7 +324,7 @@ def plotVolCal(path, VolAX, CALax, CalTrace, VolTrace, spikeIDX, Name="syncVolCA
     fig2.write_html(os.path.join(path, "spikeDET.html"))
     fig2.write_image(os.path.join(path, "spikeDET.svg"))
 ## load  vidios
-homePath = r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\rugc46\RL2\07-01-2025-ans\fov2'
+homePath = r'Z:\Adam-Lab-Shared\Data\Michal_Rubin\RUGC44\L\21-01-2026-ans\fov18'
 rr = get_rois_mask(homePath)
 plot_roi_masks(rr)
 suit2Path = os.path.join(homePath,'sync','cal','suite2p','plane0','F.npy')

@@ -55,6 +55,12 @@ POP_SUMMARY_DIR = r"Z:\Adam-Lab-Shared\Data\Michal_Rubin\data summery\2026\Pyr\c
 
 SQUARE_PANEL_PX = 520
 TWO_PANEL_HEIGHT_PX = 620
+SINGLE_PANEL_WIDTH_PX = SQUARE_PANEL_PX + 260
+PANEL_GAP_PX = 40
+PANEL_MARGIN_L_PX = 80
+PANEL_MARGIN_R_PX = 80
+PANEL_MARGIN_T_PX = 60
+PANEL_MARGIN_B_PX = 70
 CM_TO_PX = 37.7952755906
 GRID_SUBPLOT_CM = 3.0
 
@@ -1068,8 +1074,23 @@ def _add_peak_vs_spike_subplot(
                 row=row,
                 col=col,
             )
+            rng = np.random.default_rng(1234 + int(n) + (0 if et == "simple" else (100 if et == "complex" else 200)))
+            xj = x0 + rng.uniform(-0.24, 0.24, size=y.size)
+            fig.add_trace(
+                go.Scatter(
+                    x=xj,
+                    y=y,
+                    mode="markers",
+                    marker=dict(symbol="circle-open", color=colr, size=6, line=dict(color=colr, width=1)),
+                    showlegend=False,
+                    hovertemplate=f"type={et}<br>n_spikes={'6+' if int(n)==6 else int(n)}<br>peak=%{{y:.3f}}<extra></extra>",
+                ),
+                row=row,
+                col=col,
+            )
             if add_mean_lines:
                 m = float(np.nanmean(y))
+                # Draw mean lines after points so they stay visible as top layer.
                 if et == "simple":
                     # white border under black mean line
                     fig.add_trace(
@@ -1103,7 +1124,7 @@ def _add_peak_vs_spike_subplot(
                         x=[x0 - 0.16, x0 + 0.16],
                         y=[m, m],
                         mode="lines",
-                        line=dict(color=colr, width=3.5),
+                        line=dict(color=("black" if et == "simple" else colr), width=3.5),
                         showlegend=False,
                         hovertemplate=f"type={et}<br>n_spikes={'6+' if int(n)==6 else int(n)}<br>mean={m:.3f}<extra></extra>",
                     ),
@@ -1124,20 +1145,6 @@ def _add_peak_vs_spike_subplot(
                         yanchor="bottom",
                         font=dict(size=10, color=colr),
                     )
-            rng = np.random.default_rng(1234 + int(n) + (0 if et == "simple" else (100 if et == "complex" else 200)))
-            xj = x0 + rng.uniform(-0.24, 0.24, size=y.size)
-            fig.add_trace(
-                go.Scatter(
-                    x=xj,
-                    y=y,
-                    mode="markers",
-                    marker=dict(symbol="circle-open", color=colr, size=6, line=dict(color=colr, width=1)),
-                    showlegend=False,
-                    hovertemplate=f"type={et}<br>n_spikes={'6+' if int(n)==6 else int(n)}<br>peak=%{{y:.3f}}<extra></extra>",
-                ),
-                row=row,
-                col=col,
-            )
     fig.update_xaxes(
         tickmode="array",
         tickvals=tick_vals,
@@ -1280,7 +1287,8 @@ def _plot_cell_two_panel(
     _add_event_length_subplot(fig, chosen_df, 1, 3, show_legend=False, y_col=str(y_col), y_label=str(y_label))
     fig.update_layout(
         template="simple_white",
-        width=(3 * SQUARE_PANEL_PX) + 220,
+        # Keep pooled per-subplot width consistent with cellavg_amp_vs_spikecount_zscore panel size.
+        width=(3 * SINGLE_PANEL_WIDTH_PX),
         height=TWO_PANEL_HEIGHT_PX,
         title="",
     )
@@ -1402,6 +1410,42 @@ def _plot_all_cells_grid(
     fig.write_html(save_html)
     _safe_write_svg(fig, save_svg)
 
+    # Save an exact subplot mapping that matches THIS figure generation call.
+    # This avoids any mismatch from later reconstruction assumptions.
+    try:
+        map_rows = []
+        for i, cid in enumerate(ids):
+            r = i // ncols + 1
+            c = i % ncols + 1
+            sub = all_df[all_df["cell_trace_id"] == cid]
+            row0 = sub.iloc[0] if len(sub) > 0 else None
+            map_rows.append(
+                {
+                    "idx": int(i + 1),
+                    "row": int(r),
+                    "col": int(c),
+                    "cell_trace_id": str(cid),
+                    "cell_trace_label": str(label_by_id.get(cid, cid)),
+                    "cell_path": ("" if row0 is None else str(row0.get("cell_path", ""))),
+                    "suffix": ("" if row0 is None else str(row0.get("suffix", ""))),
+                    "pipeline": ("" if row0 is None else str(row0.get("pipeline", ""))),
+                    "brainState": ("" if row0 is None else str(row0.get("brainState", ""))),
+                    "figure_mode": str(mode),
+                    "ncols": int(ncols),
+                    "nrows": int(nrows),
+                    "figure_html": str(save_html),
+                }
+            )
+        if len(map_rows) > 0:
+            map_df = pd.DataFrame(map_rows)
+            base, _ = os.path.splitext(str(save_html))
+            map_csv = base + "_mapping.csv"
+            map_tsv = base + "_mapping.tsv"
+            map_df.to_csv(map_csv, index=False)
+            map_df.to_csv(map_tsv, sep="\t", index=False)
+    except Exception as _map_err:
+        print(f"[warn] failed to save all-cells mapping for {save_html}: {_map_err}")
+
 
 def _plot_population_two_panel(
     all_df,
@@ -1411,10 +1455,15 @@ def _plot_population_two_panel(
     y_col="amp_local_dff",
     y_label="calcium response (local dF/F0)",
 ):
+    ncols = 3
+    panel_plot_w = max(120, int(SINGLE_PANEL_WIDTH_PX - PANEL_MARGIN_L_PX - PANEL_MARGIN_R_PX))
+    plot_w = int(ncols * panel_plot_w + (ncols - 1) * PANEL_GAP_PX)
+    hspace = float(PANEL_GAP_PX) / float(plot_w) if ncols > 1 else 0.0
+    fig_w = int(plot_w + PANEL_MARGIN_L_PX + PANEL_MARGIN_R_PX)
     fig = make_subplots(
         rows=1,
         cols=3,
-        horizontal_spacing=0.08,
+        horizontal_spacing=hspace,
     )
     _add_peak_vs_spike_subplot(
         fig,
@@ -1430,9 +1479,10 @@ def _plot_population_two_panel(
     _add_event_length_subplot(fig, all_df, 1, 3, show_legend=False, y_col=str(y_col), y_label=str(y_label))
     fig.update_layout(
         template="simple_white",
-        width=(3 * SQUARE_PANEL_PX) + 220,
+        width=fig_w,
         height=TWO_PANEL_HEIGHT_PX,
         title="",
+        margin=dict(l=PANEL_MARGIN_L_PX, r=PANEL_MARGIN_R_PX, t=PANEL_MARGIN_T_PX, b=PANEL_MARGIN_B_PX),
     )
     fig.write_html(save_html)
     _safe_write_svg(fig, save_svg)
@@ -1520,7 +1570,12 @@ def _plot_pooled_fit_panels(
 ):
     if all_df is None or len(all_df) == 0:
         return
-    fig = make_subplots(rows=1, cols=2, horizontal_spacing=0.10)
+    ncols = 2
+    panel_plot_w = max(120, int(SINGLE_PANEL_WIDTH_PX - PANEL_MARGIN_L_PX - PANEL_MARGIN_R_PX))
+    plot_w = int(ncols * panel_plot_w + (ncols - 1) * PANEL_GAP_PX)
+    hspace = float(PANEL_GAP_PX) / float(plot_w) if ncols > 1 else 0.0
+    fig_w = int(plot_w + PANEL_MARGIN_L_PX + PANEL_MARGIN_R_PX)
+    fig = make_subplots(rows=1, cols=2, horizontal_spacing=hspace)
 
     # Subplot 1: per-event-type fit of calcium vs spike count (all events).
     work = all_df.copy()
@@ -1712,8 +1767,9 @@ def _plot_pooled_fit_panels(
     fig.update_layout(
         template="simple_white",
         title="",
-        width=(2 * SQUARE_PANEL_PX) + 200,
+        width=fig_w,
         height=TWO_PANEL_HEIGHT_PX,
+        margin=dict(l=PANEL_MARGIN_L_PX, r=PANEL_MARGIN_R_PX, t=PANEL_MARGIN_T_PX, b=PANEL_MARGIN_B_PX),
     )
     fig.write_html(save_html)
     _safe_write_svg(fig, save_svg)
@@ -1739,6 +1795,8 @@ def _plot_cellavg_amp_vs_spikes(
     fig = go.Figure()
     tick_vals, tick_txt = _spike_ticks()
     type_offset = {"simple": -0.18, "complex": 0.0, "plateau": 0.18}
+    ann_stack_y = {"simple": 1.08, "complex": 1.05, "plateau": 1.02}
+    ann_tag = {"simple": "S", "complex": "C", "plateau": "P"}
     ann = []
     for et in ("simple", "complex", "plateau"):
         colr = PLOT_TYPE_COLOR[et]
@@ -1762,7 +1820,7 @@ def _plot_cellavg_amp_vs_spikes(
                     line=dict(color=colr, width=1),
                     fillcolor=colr,
                     opacity=0.15,
-                    width=0.22,
+                    width=0.34,
                     showlegend=False,
                     hoverinfo="skip",
                 )
@@ -1772,7 +1830,7 @@ def _plot_cellavg_amp_vs_spikes(
             txt = []
             for _, r in subn.iterrows():
                 rng = np.random.default_rng(abs(hash((str(r["cell_trace_id"]), et, int(nb)))) % (2**32))
-                x.append(x0 + float(rng.uniform(-0.09, 0.09)))
+                x.append(x0 + float(rng.uniform(-0.08, 0.08)))
                 yy.append(float(r["cell_mean_amp"]))
                 txt.append(f"{r['cell_trace_label']}<br>type={et}<br>n={'6+' if nb==6 else nb}")
             fig.add_trace(
@@ -1789,32 +1847,59 @@ def _plot_cellavg_amp_vs_spikes(
                 )
             )
             m = float(np.nanmean(y))
+            if et == "simple":
+                # Match pooled plot style: white edge under a black center mean line.
+                fig.add_trace(
+                    go.Scatter(
+                        x=[x0 - 0.11, x0 + 0.11],
+                        y=[m, m],
+                        mode="lines",
+                        line=dict(color="white", width=6),
+                        showlegend=False,
+                        hoverinfo="skip",
+                    )
+                )
+            else:
+                # Add black border for complex/plateau mean lines.
+                fig.add_trace(
+                    go.Scatter(
+                        x=[x0 - 0.11, x0 + 0.11],
+                        y=[m, m],
+                        mode="lines",
+                        line=dict(color="black", width=5.5),
+                        showlegend=False,
+                        hoverinfo="skip",
+                    )
+                )
             fig.add_trace(
                 go.Scatter(
                     x=[x0 - 0.11, x0 + 0.11],
                     y=[m, m],
                     mode="lines",
-                    line=dict(color=colr, width=2),
+                    line=dict(color=("black" if et == "simple" else colr), width=2.8),
                     showlegend=False,
                     hovertemplate=f"type={et}<br>n={'6+' if nb==6 else nb}<br>mean={m:.3f}<extra></extra>",
                 )
             )
             ann.append(
                 dict(
-                    x=x0,
-                    y=1.02,
+                    x=float(nb),
+                    y=float(ann_stack_y.get(et, 1.02)),
                     xref="x",
                     yref="paper",
-                    text=f"{m:.2f}",
+                    text=f"{ann_tag.get(et, et[0].upper())}:{m:.2f}",
                     showarrow=False,
+                    xanchor="center",
+                    yanchor="bottom",
                     font=dict(size=9, color=colr),
                 )
             )
     fig.update_layout(
         template="simple_white",
-        width=SQUARE_PANEL_PX + 260,
+        width=SINGLE_PANEL_WIDTH_PX,
         height=TWO_PANEL_HEIGHT_PX,
         title="",
+        margin=dict(l=PANEL_MARGIN_L_PX, r=PANEL_MARGIN_R_PX, t=PANEL_MARGIN_T_PX, b=PANEL_MARGIN_B_PX),
         annotations=ann,
         xaxis=dict(
             title="# spikes in event",
@@ -2068,26 +2153,50 @@ def _shape_plot_groups(groups, title, save_html, save_svg, mode="dff"):
 
 
 def _find_plus_plateau_pkls(cell_folder):
-    # Accept only canonical plateau PKL names:
-    #   spike_detection_refined_new_plus_plateau.pkl
-    #   spike_detection_refined_new_plus_plateaum0.pkl / r0 / m1 / r1 ...
-    # and ignore chained outputs like *_plus_plateau_plus_plateau*.pkl.
-    pat = re.compile(
-        r"^spike_detection_refined_new_plus_plateau(?:[mr]\d+)?\.pkl$",
-        flags=re.IGNORECASE,
-    )
-    found = glob.glob(os.path.join(cell_folder, "spike_detection_refined_new_plus_plateau*.pkl"))
-    keep = [p for p in found if pat.match(os.path.basename(p))]
-    return sorted(keep, key=lambda p: os.path.basename(p).lower())
+    # Prefer spike PKLs corrected after high-plateau spike removal:
+    #   spike_detection_refined_new_rm_complex_highplateau.pkl
+    #   spike_detection_refined_newm0_rm_complex_highplateau.pkl / r0 / ...
+    # Fall back to canonical plateau PKLs when corrected files are absent.
+    patterns = [
+        (0, re.compile(r"^spike_detection_refined_new(?P<suf>[mr]\d+)?_rm_complex_highplateau\.pkl$", re.IGNORECASE)),
+        (1, re.compile(r"^spike_detection_refined_new(?P<suf>[mr]\d+)?_rm_complex_after_peak\.pkl$", re.IGNORECASE)),
+        (2, re.compile(r"^spike_detection_refined_new_plus_plateau(?P<suf>[mr]\d+)?\.pkl$", re.IGNORECASE)),
+    ]
+
+    best_by_suffix = {}
+    for p in glob.glob(os.path.join(cell_folder, "spike_detection_refined_new*.pkl")):
+        name = os.path.basename(p)
+        for priority, pat in patterns:
+            m = pat.match(name)
+            if not m:
+                continue
+            suffix = (m.group("suf") or "main").lower()
+            old = best_by_suffix.get(suffix)
+            if old is None or priority < old[0]:
+                best_by_suffix[suffix] = (priority, p)
+            break
+
+    def _sort_key(item):
+        suffix, (_priority, path) = item
+        rank = {"main": -1, "m0": 0, "r0": 1, "m1": 2, "r1": 3}
+        return (rank.get(suffix, 99), suffix, os.path.basename(path).lower())
+
+    return [path for _suffix, (_priority, path) in sorted(best_by_suffix.items(), key=_sort_key)]
 
 
 def _suffix_from_pkl(path):
     name = os.path.basename(path)
-    m = re.search(r"spike_detection_refined_new_plus_plateau(.*?)\.pkl$", name, flags=re.IGNORECASE)
-    if not m:
-        return "main"
-    s = m.group(1)
-    return "main" if s == "" else s.lower()
+    patterns = [
+        r"^spike_detection_refined_new(?P<suf>[mr]\d+)?_rm_complex_highplateau\.pkl$",
+        r"^spike_detection_refined_new(?P<suf>[mr]\d+)?_rm_complex_after_peak\.pkl$",
+        r"^spike_detection_refined_new_plus_plateau(?P<suf>[mr]\d+)?\.pkl$",
+    ]
+    for pat in patterns:
+        m = re.search(pat, name, flags=re.IGNORECASE)
+        if m:
+            s = m.group("suf")
+            return "main" if not s else s.lower()
+    return "main"
 
 
 def _is_motor_row(row):
@@ -2241,7 +2350,7 @@ def run_pyr_event_cal3(db_path=DB_PATH, max_cells=None, include_plateau=True, fi
             continue
         pkl_list = _find_plus_plateau_pkls(cell_folder)
         if len(pkl_list) == 0:
-            print(f"[SKIP] no spike_detection_refined_new_plus_plateau pkl: {cell_folder}")
+            print(f"[SKIP] no corrected/plus-plateau spike pkl: {cell_folder}")
             continue
         is_motor = _is_motor_row(row)
         if is_motor:
@@ -2656,6 +2765,32 @@ def run_pyr_event_cal3(db_path=DB_PATH, max_cells=None, include_plateau=True, fi
                 print(f"[WARN] event choosing summary failed ({pipeline_name}): {e}")
 
     out_df = pd.concat(all_rows, ignore_index=True)
+    one_spike_complex = out_df[
+        (out_df["event_type"].astype(str).str.lower() == "complex")
+        & (pd.to_numeric(out_df["n_spikes"], errors="coerce") == 1)
+    ].copy()
+    if len(one_spike_complex) > 0:
+        report_cols = [
+            "cell_folder",
+            "suffix",
+            "selection_pipeline",
+            "event_idx",
+            "first_spike",
+            "pkl_name",
+        ]
+        report_cols = [c for c in report_cols if c in one_spike_complex.columns]
+        uniq = (
+            one_spike_complex[["cell_folder", "suffix", "pkl_name"]]
+            .drop_duplicates()
+            .sort_values(["cell_folder", "suffix", "pkl_name"])
+        )
+        print("\n[CHECK] cells with complex events containing exactly 1 spike:")
+        for _, rr in uniq.iterrows():
+            print(f"  {rr['cell_folder']} | suffix={rr['suffix']} | pkl={rr['pkl_name']}")
+        print(f"[CHECK] total one-spike complex event rows: {len(one_spike_complex)}")
+        print(one_spike_complex[report_cols].to_string(index=False))
+    else:
+        print("\n[CHECK] no complex events with exactly 1 spike found")
     print(f"\n[ALL] processed {len(out_df)} events (population CSV saving disabled)")
     return out_df
 

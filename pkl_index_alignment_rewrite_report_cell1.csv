@@ -1,0 +1,5 @@
+cell_path,state,pkl_path,status,reason,tv_len,n_true,sp_max,compact_offset_frames
+Z:\Adam-Lab-Shared\Data\Michal_Rubin\rugc41\RW\30-09-2025-MOTOR\FOV1\cell1,m0,Z:\Adam-Lab-Shared\Data\Michal_Rubin\rugc41\RW\30-09-2025-MOTOR\FOV1\cell1\spike_detection_refined_newm0_rm_complex_highplateau.pkl,no_change,already_full_index,12987,12987,12981,0
+Z:\Adam-Lab-Shared\Data\Michal_Rubin\rugc41\RW\30-09-2025-MOTOR\FOV1\cell1,r0,Z:\Adam-Lab-Shared\Data\Michal_Rubin\rugc41\RW\30-09-2025-MOTOR\FOV1\cell1\spike_detection_refined_newr0_rm_complex_highplateau.pkl,no_change,already_full_index,7359,7358,14944,0
+Z:\Adam-Lab-Shared\Data\Michal_Rubin\rugc41\RW\30-09-2025-MOTOR\FOV1\cell1,m1,Z:\Adam-Lab-Shared\Data\Michal_Rubin\rugc41\RW\30-09-2025-MOTOR\FOV1\cell1\spike_detection_refined_newm1_rm_complex_highplateau.pkl,no_change,already_full_index,15781,15780,15999,0
+Z:\Adam-Lab-Shared\Data\Michal_Rubin\rugc41\RW\30-09-2025-MOTOR\FOV1\cell1,r1,Z:\Adam-Lab-Shared\Data\Michal_Rubin\rugc41\RW\30-09-2025-MOTOR\FOV1\cell1\spike_detection_refined_newr1_rm_complex_highplateau.pkl,no_change,already_full_index,15058,15057,17914,0
