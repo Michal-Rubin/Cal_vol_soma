@@ -4,6 +4,8 @@ import glob
 import pickle
 import copy
 import shutil
+import math
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -62,30 +64,26 @@ def _safe_to_csv(df, out_csv_path, index=False):
 
 def _safe_pickle_load(fp):
     """
-    Load pickle robustly across NumPy private-module path changes.
-    """
-    try:
-        return pickle.load(fp)
-    except ModuleNotFoundError as exc:
-        missing = str(getattr(exc, "name", "") or "")
-        # Cross-version compatibility: some pickles reference `numpy._core.*`
-        # while older environments expose `numpy.core.*`.
-        if missing.startswith("numpy._core"):
-            import sys
-            import numpy as _np
+    Load pickle files saved with newer NumPy versions.
 
-            if "numpy._core" not in sys.modules:
-                sys.modules["numpy._core"] = _np.core
-            if "numpy._core.multiarray" not in sys.modules:
-                sys.modules["numpy._core.multiarray"] = _np.core.multiarray
-            if "numpy._core._multiarray_umath" not in sys.modules:
-                try:
-                    sys.modules["numpy._core._multiarray_umath"] = _np.core._multiarray_umath
-                except Exception:
-                    pass
-            fp.seek(0)
-            return pickle.load(fp)
-        raise
+    Newer NumPy pickles may reference:
+        numpy._core
+
+    Older NumPy, like 1.18.5, uses:
+        numpy.core
+
+    This remaps the module name during unpickling.
+    """
+    import pickle
+
+    class NumpyCompatUnpickler(pickle.Unpickler):
+        def find_class(self, module, name):
+            if module.startswith("numpy._core"):
+                module = module.replace("numpy._core", "numpy.core", 1)
+            return super().find_class(module, name)
+
+    fp.seek(0)
+    return NumpyCompatUnpickler(fp).load()
 
 
 def _safe_cal_sr_from_db(cell_folder, db_path=None, fallback=FS_CA_HZ_FALLBACK):
@@ -207,6 +205,8 @@ def _in_any_segment(frame_idx, segments):
 def _suffix_from_pkl_name(path):
     name = os.path.basename(str(path))
     patterns = [
+        r"^spike_detection_refined_new(?P<suf>[mr]\d+)?_rm_complex_eventpostpeak\.pkl$",
+        r"^event_spike_overlay__plus_plateau(?P<suf>[mr]\d+)?_rm_complex_eventpostpeak\.pkl$",
         r"^spike_detection_refined_new(?P<suf>[mr]\d+)?_rm_complex_highplateau\.pkl$",
         r"^event_spike_overlay__plus_plateau(?P<suf>[mr]\d+)?_rm_complex_highplateau\.pkl$",
         r"^spike_detection_refined_new(?P<suf>[mr]\d+)?_rm_complex_after_peak\.pkl$",
@@ -223,13 +223,13 @@ def _suffix_from_pkl_name(path):
 
 
 def _is_rm_complex_highplateau_pkl(path):
-    """Return True for corrected spike PKLs with high-plateau removal."""
+    """Return True for corrected spike PKLs already using full local indices."""
     if not isinstance(path, str) or path.strip() == "":
         return False
     name = os.path.basename(str(path))
     return bool(
         re.search(
-            r"^spike_detection_refined_new(?P<suf>[mr]\d+)?_rm_complex_highplateau\.pkl$",
+            r"^spike_detection_refined_new(?P<suf>[mr]\d+)?_rm_complex_(eventpostpeak|highplateau)\.pkl$",
             name,
             flags=re.IGNORECASE,
         )
@@ -240,17 +240,19 @@ def _preferred_spike_pkl_priority(path):
     """
     Return (priority, suffix) for spike PKLs used to build real FR.
 
-    Lower priority wins. The corrected high-plateau-removal PKL is preferred when
+    Lower priority wins. The corrected event-postpeak PKL is preferred when
     available because it contains the post-removal `vm_all_spikes` used for FR.
     """
     name = os.path.basename(str(path))
     patterns = [
-        (0, r"^spike_detection_refined_new(?P<suf>[mr]\d+)?_rm_complex_highplateau\.pkl$"),
-        (1, r"^event_spike_overlay__plus_plateau(?P<suf>[mr]\d+)?_rm_complex_highplateau\.pkl$"),
-        (2, r"^spike_detection_refined_new(?P<suf>[mr]\d+)?_rm_complex_after_peak\.pkl$"),
-        (3, r"^spike_detection_refined_new_plus_plateau(?P<suf>[mr]\d+)?\.pkl$"),
-        (4, r"^final_correct_spike_detection(?P<suf>[mr]\d+)?\.pkl$"),
-        (5, r"^spike_detection_refined_new(?P<suf>[mr]\d+)?\.pkl$"),
+        (0, r"^spike_detection_refined_new(?P<suf>[mr]\d+)?_rm_complex_eventpostpeak\.pkl$"),
+        (1, r"^event_spike_overlay__plus_plateau(?P<suf>[mr]\d+)?_rm_complex_eventpostpeak\.pkl$"),
+        (2, r"^spike_detection_refined_new(?P<suf>[mr]\d+)?_rm_complex_highplateau\.pkl$"),
+        (3, r"^event_spike_overlay__plus_plateau(?P<suf>[mr]\d+)?_rm_complex_highplateau\.pkl$"),
+        (4, r"^spike_detection_refined_new(?P<suf>[mr]\d+)?_rm_complex_after_peak\.pkl$"),
+        (5, r"^spike_detection_refined_new_plus_plateau(?P<suf>[mr]\d+)?\.pkl$"),
+        (6, r"^final_correct_spike_detection(?P<suf>[mr]\d+)?\.pkl$"),
+        (7, r"^spike_detection_refined_new(?P<suf>[mr]\d+)?\.pkl$"),
     ]
     for priority, pat in patterns:
         m = re.search(pat, name, flags=re.IGNORECASE)
@@ -265,15 +267,17 @@ def _find_preferred_spike_pkls(cell_folder):
     Find one best spike-detection PKL per suffix for suite2p/CASCADE FR evaluation.
 
     Priority:
-      1. corrected high-plateau removal PKL
-      2. older after-peak removal PKL
-      3. plus-plateau PKL
-      4. final_correct_spike_detection PKL
-      5. raw spike_detection_refined_new PKL
+      1. corrected event-postpeak removal PKL
+      2. corrected high-plateau removal PKL
+      3. older after-peak removal PKL
+      4. plus-plateau PKL
+      5. final_correct_spike_detection PKL
+      6. raw spike_detection_refined_new PKL
     """
     candidates = []
     for pat in (
         "spike_detection_refined_new*.pkl",
+        "event_spike_overlay__plus_plateau*_rm_complex_eventpostpeak.pkl",
         "event_spike_overlay__plus_plateau*_rm_complex_highplateau.pkl",
         "final_correct_spike_detection*.pkl",
     ):
@@ -288,12 +292,19 @@ def _find_preferred_spike_pkls(cell_folder):
         if old is None or priority < old[0]:
             best_by_suffix[suffix] = (priority, p)
 
-    suffix_rank = {"main": -1, "m0": 0, "r0": 1, "m1": 2, "r1": 3}
+    def suffix_rank(suffix):
+        if suffix == "main":
+            return -1
+        m = re.fullmatch(r"([mr])(\d+)", str(suffix).lower())
+        if not m:
+            return 99
+        return int(m.group(2)) * 2 + (0 if m.group(1) == "m" else 1)
+
     return [
         p
         for suffix, (_priority, p) in sorted(
             best_by_suffix.items(),
-            key=lambda kv: (suffix_rank.get(kv[0], 99), kv[0], os.path.basename(kv[1][1]).lower()),
+            key=lambda kv: (suffix_rank(kv[0]), kv[0], os.path.basename(kv[1][1]).lower()),
         )
     ]
 
@@ -608,6 +619,7 @@ def load_cells_with_spike_pkls(
     default_cal_sr_hz=FS_CA_HZ_FALLBACK,
     vol_sr_hz=FS_VOL_HZ_DEFAULT,
     require_existing_dirs=True,
+    motor_mode="chunked",
 ):
     """
     Load per-cell voltage/calcium traces + spike PKLs for suite2p-based workflows.
@@ -622,6 +634,9 @@ def load_cells_with_spike_pkls(
         (`spike_detection_refined_new{suffix}_rm_complex_highplateau.pkl`) are preferred
         when available, then older corrected/plus-plateau/raw PKLs are used as fallback.
       - motor/rest states (`m0`, `r0`, `m1`, `r1`, ...) are loaded when split traces exist.
+      - `motor_mode="merged"` loads one full-trace motor state with corrected chunk offsets.
+      - `motor_mode="full"` loads one full-trace `main` state like non-motor when a full
+        non-suffixed PKL exists; otherwise it falls back to merged motor chunk payloads.
       - calcium masks and voltage masks are attached to each state and applied later by the
         evaluation functions.
 
@@ -635,6 +650,9 @@ def load_cells_with_spike_pkls(
         cell_paths=cell_paths,
         default_cal_sr_hz=default_cal_sr_hz,
     )
+    motor_mode = str(motor_mode).strip().lower()
+    if motor_mode not in {"chunked", "merged", "full"}:
+        raise ValueError("motor_mode must be 'chunked', 'merged', or 'full'")
     if len(specs) == 0:
         raise ValueError("No cell paths were provided/found. Use db_path and/or cell_paths.")
 
@@ -754,6 +772,7 @@ def load_cells_with_spike_pkls(
         # PKLs + motor state handling
         pkl_paths = _find_preferred_spike_pkls(cell_folder)
         pkl_suffix_to_path = {_suffix_from_pkl_name(p).lower(): p for p in pkl_paths}
+        has_full_trace_pkl = "main" in pkl_suffix_to_path
         has_motor_suffix_pkls = any(re.fullmatch(r"[mr]\d+", k) for k in pkl_suffix_to_path.keys())
         brain_state = str(spec.get("brain_state", "")).strip().lower()
         is_motor = ("motor" in brain_state) or has_motor_suffix_pkls
@@ -763,7 +782,32 @@ def load_cells_with_spike_pkls(
         state_order = _state_suffix_order(len(vol_bounds))
 
         states = []
-        if is_motor and len(vol_bounds) > 0:
+        use_merged_motor = bool(is_motor and (motor_mode == "merged" or (motor_mode == "full" and not has_full_trace_pkl)))
+        if use_merged_motor and pe3 is not None and hasattr(pe3, "_merge_motor_chunk_payloads"):
+            merged_path, merged_data, _merged_vol_src, _merged_cal_src = pe3._merge_motor_chunk_payloads(cell_folder, pkl_paths)
+            if isinstance(merged_data, dict):
+                states.append(
+                    {
+                        "state": "merged",
+                        "pkl_path": merged_path,
+                        "spike_pkl_data": merged_data,
+                        "vol_idx_bounds": (0, int(max(0, vol_raw.size - 1))),
+                        "cal_idx_bounds": (0, int(max(0, cal_nb.size - 1))),
+                        "volRaw": np.asarray(vol_raw, dtype=float),
+                        "volDff": np.asarray(vol_dff, dtype=float),
+                        "volMask": np.asarray(vol_mask, dtype=bool),
+                        "volRawMasked": np.asarray(vol_raw_masked, dtype=float),
+                        "volDffMasked": np.asarray(vol_dff_masked, dtype=float),
+                        "calRaw": np.asarray(cal_nb, dtype=float),
+                        "calDff": np.asarray(cal_dff, dtype=float),
+                        "calMask": np.asarray(cal_mask, dtype=bool),
+                        "calRawMasked": np.asarray(cal_raw_masked, dtype=float),
+                        "calDffMasked": np.asarray(cal_dff_masked, dtype=float),
+                        "suite2pSpks": np.asarray(spks_roi_aligned, dtype=float),
+                        "suite2pSpksMasked": np.asarray(spks_roi_masked, dtype=float),
+                    }
+                )
+        if len(states) == 0 and is_motor and motor_mode == "chunked" and len(vol_bounds) > 0:
             for (v0, v1), suf in zip(vol_bounds, state_order):
                 c0, c1 = _vol_bounds_to_cal_bounds(v0, v1, cal_len=cal_nb.size, vol_sr_hz=vol_sr_hz, cal_sr_hz=spec["cal_sr_hz"])
 
@@ -803,8 +847,11 @@ def load_cells_with_spike_pkls(
                         "suite2pSpksMasked": np.where(np.asarray(cal_m_seg, dtype=bool), np.asarray(spks_seg, dtype=float), np.nan),
                     }
                 )
-        else:
-            main_pkl = _pick_pkl(cell_folder, pkl_path=None) if len(pkl_paths) > 0 else None
+        if len(states) == 0:
+            if is_motor and motor_mode == "full" and not has_full_trace_pkl:
+                main_pkl = None
+            else:
+                main_pkl = _pick_pkl(cell_folder, pkl_path=None) if len(pkl_paths) > 0 else None
             main_data = None
             if main_pkl is not None and os.path.isfile(main_pkl):
                 with open(main_pkl, "rb") as f:
@@ -929,6 +976,51 @@ def _best_lag_corr_spks_after_fr(fr_smooth, spks_smooth, max_lag_frames):
     return best_corr, best_lag
 
 
+_CASCADE_NUMPY_COMPAT_INSTALLED = False
+
+
+def _install_cascade_numpy_compat():
+    """Provide legacy NumPy aliases required by the installed CASCADE stack."""
+    global _CASCADE_NUMPY_COMPAT_INSTALLED
+    if _CASCADE_NUMPY_COMPAT_INSTALLED:
+        return
+
+    legacy_aliases = {
+        "object": object,
+        "bool": bool,
+        "int": int,
+        "float": float,
+        "complex": complex,
+        "str": str,
+        "unicode": str,
+    }
+    for alias, value in legacy_aliases.items():
+        if alias not in np.__dict__:
+            setattr(np, alias, value)
+    if "typeDict" not in np.__dict__:
+        np.typeDict = np.sctypeDict
+    _CASCADE_NUMPY_COMPAT_INSTALLED = True
+
+
+def _validate_cascade_runtime():
+    """Fail early with an actionable error if CASCADE's legacy runtime is broken."""
+    _install_cascade_numpy_compat()
+    try:
+        import h5py  # noqa: F401
+        import tensorflow.keras  # noqa: F401
+        from cascade2p import cascade as cascade_module
+    except Exception as exc:
+        raise RuntimeError(
+            "CASCADE runtime cannot import TensorFlow/h5py. "
+            "This is an environment dependency problem, not a calcium-trace problem. "
+            "The current Cascade38 environment contains TensorFlow 2.3 / h5py 2.10 "
+            "with NumPy 1.24.4, which is incompatible. Restore the pinned legacy "
+            "CASCADE package set before running pretrained prediction. "
+            f"Original error: {type(exc).__name__}: {exc}"
+        ) from exc
+    return cascade_module
+
+
 def _predict_cascade_for_single_trace(
     cal_trace_dff,
     model_name="GC8_EXC_30Hz_smoothing50ms_high_noise",
@@ -946,8 +1038,8 @@ def _predict_cascade_for_single_trace(
     traces = x.reshape(1, -1).astype(float)  # neurons x time
 
     try:
-        from cascade2p import cascade as _cascade_mod
-    except Exception as exc:
+        _cascade_mod = _validate_cascade_runtime()
+    except ImportError as exc:
         raise ImportError(
             "CASCADE is not available in this environment. "
             "Install the CASCADE package/repo so `from cascade2p import cascade` works."
@@ -1497,9 +1589,12 @@ def _spike_idx_from_state_pkl_aligned(
     if sp.size == 0 or n_v <= 0:
         return np.array([], dtype=int)
 
-    # Corrected high-plateau PKLs are expected to already be in full local index space.
+    # Corrected cleanup PKLs and merged motor payloads are already in full local index space.
     # Bypass compact-index remap and offset estimation for them.
-    if _is_rm_complex_highplateau_pkl(pkl_path):
+    if _is_rm_complex_highplateau_pkl(pkl_path) or bool(
+        isinstance(pkl_data.get("merged_motor_chunks", None), dict)
+        and pkl_data.get("merged_motor_chunks", {}).get("enabled", False)
+    ):
         return sp[(sp >= 0) & (sp < n_v)]
 
     info = _detect_state_pkl_compact_index_mode(
@@ -2014,7 +2109,9 @@ def evaluate_suite2p_spks_as_continuous_activity(
     correlation_thr=None,
     apply_linear_scaling=True,
     use_cal_mask=True,
-    summary_out_dir=r"Z:\Adam-Lab-Shared\Data\Michal_Rubin\data summery\2026\Pyr\suite2p_vs_realfr\countineous_aproch",
+    summary_out_dir=r"Z:\Adam-Lab-Shared\Data\Michal_Rubin\data_summery\2026\Pyr\suite2p_vs_realfr\countineous_aproch",
+    summary_file_prefix="",
+    summary_title_label="Suite2p spks",
     spike_idx_offset_frames=0,
 ):
     """
@@ -2167,6 +2264,14 @@ def evaluate_suite2p_spks_as_continuous_activity(
             )
             fr_smooth = gaussian_filter1d(fr_on_cal.astype(float), sigma=sigma_frames, mode="nearest")
             spks_smooth = gaussian_filter1d(spks.astype(float), sigma=sigma_frames, mode="nearest")
+            cal_trace = np.asarray(st.get("calDff", []), dtype=float).ravel()
+            if cal_trace.size == 0:
+                cal_trace = np.asarray(st.get("calRaw", []), dtype=float).ravel()
+            cal_trace = _align_1d_len(cal_trace, n_cal, fill_value=np.nan)
+            if sigma_frames > 0:
+                cal_smooth = gaussian_filter1d(np.asarray(cal_trace, dtype=float), sigma=sigma_frames, mode="nearest")
+            else:
+                cal_smooth = np.asarray(cal_trace, dtype=float)
 
             # Always mark masked calcium frames as NaN (do not drop), so analysis
             # uses masked traces only and excludes False-mask regions.
@@ -2175,10 +2280,12 @@ def evaluate_suite2p_spks_as_continuous_activity(
             fr_smooth = np.asarray(fr_smooth, dtype=float)
             spks = np.asarray(spks, dtype=float)
             spks_smooth = np.asarray(spks_smooth, dtype=float)
+            cal_smooth = np.asarray(cal_smooth, dtype=float)
             fr_on_cal[invalid] = np.nan
             fr_smooth[invalid] = np.nan
             spks[invalid] = np.nan
             spks_smooth[invalid] = np.nan
+            cal_smooth[invalid] = np.nan
 
             corr_0lag = _pearson_corr_valid(spks_smooth, fr_smooth)
             corr_best_lag, lag_frames_best = _best_lag_corr_spks_after_fr(
@@ -2187,8 +2294,16 @@ def evaluate_suite2p_spks_as_continuous_activity(
                 max_lag_frames=max_lag_frames,
             )
             lag_s_best = float(lag_frames_best) / float(cal_sr)
+            corr_calcium_0lag = _pearson_corr_valid(cal_smooth, fr_smooth)
+            corr_calcium_best_lag, cal_lag_frames_best = _best_lag_corr_spks_after_fr(
+                fr_smooth=fr_smooth,
+                spks_smooth=cal_smooth,
+                max_lag_frames=max_lag_frames,
+            )
+            cal_lag_s_best = float(cal_lag_frames_best) / float(cal_sr)
 
             spks_smooth_lagcorr = _lag_correct_spks(spks_smooth, lag_frames_best)
+            cal_smooth_lagcorr = _lag_correct_spks(cal_smooth, cal_lag_frames_best)
             if bool(apply_linear_scaling):
                 scale, offset, fr_pred = _linear_fit_scale_offset(spks_smooth, fr_smooth)
                 scale_lag, offset_lag, fr_pred_lag = _linear_fit_scale_offset(spks_smooth_lagcorr, fr_smooth)
@@ -2494,7 +2609,9 @@ def evaluate_suite2p_spks_as_continuous_activity(
                 trace_vol_full = np.asarray(st.get("volRaw", []), dtype=float).ravel()
                 if trace_vol_full.size == 0:
                     trace_vol_full = np.asarray(pkl_data.get("trace_vol", []), dtype=float).ravel()
-                trace_cal_full = np.asarray(st.get("calRaw", []), dtype=float).ravel()
+                trace_cal_full = np.asarray(st.get("calDffMasked", []), dtype=float).ravel()
+                if trace_cal_full.size == 0:
+                    trace_cal_full = np.asarray(st.get("calDff", []), dtype=float).ravel()
                 if trace_cal_full.size == 0:
                     trace_cal_full = np.asarray(pkl_data.get("trace_cal", []), dtype=float).ravel()
 
@@ -2752,6 +2869,10 @@ def evaluate_suite2p_spks_as_continuous_activity(
                     "best_lag_pearson_r": corr_best_lag,
                     "best_lag_frames": int(lag_frames_best),
                     "best_lag_s": lag_s_best,
+                    "calcium_pearson_r_0lag": corr_calcium_0lag,
+                    "calcium_best_lag_pearson_r": corr_calcium_best_lag,
+                    "calcium_best_lag_frames": int(cal_lag_frames_best),
+                    "calcium_best_lag_s": cal_lag_s_best,
                     "scale": scale,
                     "offset": offset,
                     "fit_corr_pred_vs_real": corr_pred_vs_real,
@@ -2855,6 +2976,11 @@ def evaluate_suite2p_spks_as_continuous_activity(
     if summary_out_dir is not None:
         summary_out_dir = str(summary_out_dir)
         os.makedirs(summary_out_dir, exist_ok=True)
+        summary_file_prefix = "" if summary_file_prefix is None else str(summary_file_prefix)
+        summary_title_label = "Prediction" if summary_title_label is None else str(summary_title_label)
+
+        def _summary_path(base_name):
+            return os.path.join(summary_out_dir, f"{summary_file_prefix}{base_name}")
 
         if len(valid) > 0:
             # 0) Save lag/correlation/error summary tables
@@ -2862,6 +2988,9 @@ def evaluate_suite2p_spks_as_continuous_activity(
             for _col in (
                 "pearson_r_0lag",
                 "best_lag_pearson_r",
+                "calcium_pearson_r_0lag",
+                "calcium_best_lag_pearson_r",
+                "calcium_best_lag_s",
                 "fit_corr_pred_vs_real",
                 "fit_corr_pred_lag_vs_real",
                 "best_lag_s",
@@ -2884,6 +3013,9 @@ def evaluate_suite2p_spks_as_continuous_activity(
                 "state",
                 "pearson_r_0lag",
                 "best_lag_pearson_r",
+                "calcium_pearson_r_0lag",
+                "calcium_best_lag_pearson_r",
+                "calcium_best_lag_s",
                 "fit_corr_pred_vs_real",
                 "fit_corr_pred_lag_vs_real",
                 "best_lag_s",
@@ -2895,7 +3027,7 @@ def evaluate_suite2p_spks_as_continuous_activity(
                 "error_sigma_mad_hz",
             ]
             per_state_cols = [c for c in per_state_cols if c in valid_csv.columns]
-            lag_corr_state_csv = os.path.join(summary_out_dir, f"lag_corr_error_summary_by_state_{z_mode_file_tag}.csv")
+            lag_corr_state_csv = _summary_path(f"lag_corr_error_summary_by_state_{z_mode_file_tag}.csv")
             lag_corr_state_csv = _safe_to_csv(valid_csv.loc[:, per_state_cols], lag_corr_state_csv, index=False)
 
             agg_map = {
@@ -2903,6 +3035,9 @@ def evaluate_suite2p_spks_as_continuous_activity(
                 "n_states_valid": ("state", "nunique"),
                 "corr_before_lag_mean": ("pearson_r_0lag", "mean"),
                 "corr_after_lag_mean": ("best_lag_pearson_r", "mean"),
+                "calcium_corr_before_lag_mean": ("calcium_pearson_r_0lag", "mean"),
+                "calcium_corr_after_lag_mean": ("calcium_best_lag_pearson_r", "mean"),
+                "calcium_optimal_lag_s_mean": ("calcium_best_lag_s", "mean"),
                 "fit_corr_before_lag_mean": ("fit_corr_pred_vs_real", "mean"),
                 "fit_corr_after_lag_mean": ("fit_corr_pred_lag_vs_real", "mean"),
                 "optimal_lag_s_mean": ("best_lag_s", "mean"),
@@ -2918,7 +3053,7 @@ def evaluate_suite2p_spks_as_continuous_activity(
             for out_name, (src_col, fn) in agg_map.items():
                 if src_col in valid_csv.columns:
                     agg_map_use[out_name] = (src_col, fn)
-            lag_corr_cell_csv = os.path.join(summary_out_dir, f"lag_corr_error_summary_by_cell_path_{z_mode_file_tag}.csv")
+            lag_corr_cell_csv = _summary_path(f"lag_corr_error_summary_by_cell_path_{z_mode_file_tag}.csv")
             lag_corr_cell_df = (
                 valid_csv.groupby("cell_path", as_index=False)
                 .agg(**agg_map_use)
@@ -2942,6 +3077,9 @@ def evaluate_suite2p_spks_as_continuous_activity(
                             "n_states_valid": 1,
                             "corr_before_lag_mean": pd.to_numeric(motor_rows.get("pearson_r_0lag", np.nan), errors="coerce"),
                             "corr_after_lag_mean": pd.to_numeric(motor_rows.get("best_lag_pearson_r", np.nan), errors="coerce"),
+                            "calcium_corr_before_lag_mean": pd.to_numeric(motor_rows.get("calcium_pearson_r_0lag", np.nan), errors="coerce"),
+                            "calcium_corr_after_lag_mean": pd.to_numeric(motor_rows.get("calcium_best_lag_pearson_r", np.nan), errors="coerce"),
+                            "calcium_optimal_lag_s_mean": pd.to_numeric(motor_rows.get("calcium_best_lag_s", np.nan), errors="coerce"),
                             "fit_corr_before_lag_mean": pd.to_numeric(motor_rows.get("fit_corr_pred_vs_real", np.nan), errors="coerce"),
                             "fit_corr_after_lag_mean": pd.to_numeric(motor_rows.get("fit_corr_pred_lag_vs_real", np.nan), errors="coerce"),
                             "optimal_lag_s_mean": pd.to_numeric(motor_rows.get("best_lag_s", np.nan), errors="coerce"),
@@ -2998,9 +3136,9 @@ def evaluate_suite2p_spks_as_continuous_activity(
                     return np.nan, n
                 return float(1.0 - ss_res / ss_tot), n
 
-            ev_csv = os.path.join(summary_out_dir, f"corr_explained_variance_{z_mode_file_tag}.csv")
-            ev_html = os.path.join(summary_out_dir, f"corr_explained_variance_{z_mode_file_tag}.html")
-            ev_svg = os.path.join(summary_out_dir, f"corr_explained_variance_{z_mode_file_tag}.svg") if bool(save_svg) else None
+            ev_csv = _summary_path(f"corr_explained_variance_{z_mode_file_tag}.csv")
+            ev_html = _summary_path(f"corr_explained_variance_{z_mode_file_tag}.html")
+            ev_svg = _summary_path(f"corr_explained_variance_{z_mode_file_tag}.svg") if bool(save_svg) else None
 
             y_corr = pd.to_numeric(valid_csv.get("fit_corr_pred_lag_vs_real", np.nan), errors="coerce").to_numpy(dtype=float)
             y_z = _fisher_z_local(y_corr)
@@ -3109,6 +3247,8 @@ def evaluate_suite2p_spks_as_continuous_activity(
             lag_ms = 1000.0 * pd.to_numeric(valid.get("best_lag_s", np.nan), errors="coerce").to_numpy(dtype=float)
             fit_r0 = pd.to_numeric(valid.get("fit_corr_pred_vs_real", np.nan), errors="coerce").to_numpy(dtype=float)
             fit_rl = pd.to_numeric(valid.get("fit_corr_pred_lag_vs_real", np.nan), errors="coerce").to_numpy(dtype=float)
+            cal_r0 = pd.to_numeric(valid.get("calcium_pearson_r_0lag", np.nan), errors="coerce").to_numpy(dtype=float)
+            cal_rl = pd.to_numeric(valid.get("calcium_best_lag_pearson_r", np.nan), errors="coerce").to_numpy(dtype=float)
             emean = pd.to_numeric(valid.get("error_mean_hz", np.nan), errors="coerce").to_numpy(dtype=float)
             estd = pd.to_numeric(valid.get("error_sigma_mad_hz", np.nan), errors="coerce").to_numpy(dtype=float)
             freq_non_simple = pd.to_numeric(valid.get("non_simple_event_freq_hz", np.nan), errors="coerce").to_numpy(dtype=float)
@@ -3152,38 +3292,38 @@ def evaluate_suite2p_spks_as_continuous_activity(
                     return
                 xline = np.linspace(x0, x1, 120)
                 yline = m * xline + b
-                _fig.add_trace(
-                    go.Scatter(
-                        x=xline,
-                        y=yline,
-                        mode="lines",
-                        line=dict(color=_color, width=2),
-                        showlegend=False,
-                        hovertemplate="linear fit<extra></extra>",
-                    ),
-                    row=row,
-                    col=col,
+                line_trace = go.Scatter(
+                    x=xline,
+                    y=yline,
+                    mode="lines",
+                    line=dict(color=_color, width=2),
+                    showlegend=False,
+                    hovertemplate="linear fit<extra></extra>",
                 )
+                if row is None or col is None:
+                    _fig.add_trace(line_trace)
+                else:
+                    _fig.add_trace(line_trace, row=row, col=col)
                 r = _pearson_corr_valid(xx, yy)
                 y0 = float(np.nanmin(yy))
                 y1 = float(np.nanmax(yy))
                 xt = x0 + 0.98 * (x1 - x0)
                 yt = y0 + 0.04 * (y1 - y0)
                 txt = f"r={r:.3f}<br>m={m:.3g}"
-                _fig.add_trace(
-                    go.Scatter(
-                        x=[xt],
-                        y=[yt],
-                        mode="text",
-                        text=[txt],
-                        textposition="bottom right",
-                        textfont=dict(size=11, color="black"),
-                        showlegend=False,
-                        hoverinfo="skip",
-                    ),
-                    row=row,
-                    col=col,
+                text_trace = go.Scatter(
+                    x=[xt],
+                    y=[yt],
+                    mode="text",
+                    text=[txt],
+                    textposition="bottom right",
+                    textfont=dict(size=11, color="black"),
+                    showlegend=False,
+                    hoverinfo="skip",
                 )
+                if row is None or col is None:
+                    _fig.add_trace(text_trace)
+                else:
+                    _fig.add_trace(text_trace, row=row, col=col)
 
             m_sc1 = np.isfinite(freq_non_simple) & np.isfinite(fit_rl)
             fig_hist.add_trace(
@@ -3234,7 +3374,7 @@ def evaluate_suite2p_spks_as_continuous_activity(
                 template="simple_white",
                 width=3000,
                 height=980,
-                title=f"Suite2p spks vs real FR | population histograms + frequency scatter | z_mode={z_mode_title_tag}",
+                title=f"{summary_title_label} vs real FR | population histograms + frequency scatter | z_mode={z_mode_title_tag}",
                 showlegend=False,
             )
             fig_hist.update_xaxes(title_text="r", row=1, col=1)
@@ -3258,11 +3398,11 @@ def evaluate_suite2p_spks_as_continuous_activity(
             fig_hist.update_yaxes(title_text="fit r (lag corrected)", row=2, col=4)
             fig_hist.update_yaxes(title_text="fit r (lag corrected)", row=2, col=5)
 
-            hist_html = os.path.join(summary_out_dir, f"hist_corr_and_lag_{z_mode_file_tag}.html")
+            hist_html = _summary_path(f"hist_corr_and_lag_{z_mode_file_tag}.html")
             fig_hist.write_html(hist_html)
             hist_svg = None
             if bool(save_svg):
-                hist_svg = os.path.join(summary_out_dir, f"hist_corr_and_lag_{z_mode_file_tag}.svg")
+                hist_svg = _summary_path(f"hist_corr_and_lag_{z_mode_file_tag}.svg")
                 try:
                     fig_hist.write_image(hist_svg)
                 except Exception:
@@ -3326,7 +3466,7 @@ def evaluate_suite2p_spks_as_continuous_activity(
                 template="simple_white",
                 width=1950,
                 height=680,
-                title=f"Suite2p spks vs real FR | frequency scatter summary | z_mode={z_mode_title_tag}",
+                title=f"{summary_title_label} vs real FR | frequency scatter summary | z_mode={z_mode_title_tag}",
                 showlegend=False,
             )
             fig_sc3.update_xaxes(title_text="non-simple events/s", row=1, col=1)
@@ -3335,17 +3475,183 @@ def evaluate_suite2p_spks_as_continuous_activity(
             fig_sc3.update_yaxes(title_text="fit r (lag corrected)", row=1, col=1)
             fig_sc3.update_yaxes(title_text="fit r (lag corrected)", row=1, col=2)
             fig_sc3.update_yaxes(title_text="fit r (lag corrected)", row=1, col=3)
-            hist_sc3_html = os.path.join(summary_out_dir, f"hist_corr_and_lag_scatter3_{z_mode_file_tag}.html")
+            hist_sc3_html = _summary_path(f"hist_corr_and_lag_scatter3_{z_mode_file_tag}.html")
             fig_sc3.write_html(hist_sc3_html)
             hist_sc3_svg = None
             if bool(save_svg):
-                hist_sc3_svg = os.path.join(summary_out_dir, f"hist_corr_and_lag_scatter3_{z_mode_file_tag}.svg")
+                hist_sc3_svg = _summary_path(f"hist_corr_and_lag_scatter3_{z_mode_file_tag}.svg")
                 try:
                     fig_sc3.write_image(hist_sc3_svg)
                 except Exception:
                     hist_sc3_svg = None
             res_df.attrs["summary_hist_scatter3_html"] = hist_sc3_html
             res_df.attrs["summary_hist_scatter3_svg"] = hist_sc3_svg
+
+            def _make_calcium_scatter3(yvals, lag_label, file_stem):
+                m1 = np.isfinite(freq_non_simple) & np.isfinite(yvals)
+                m2 = np.isfinite(mean_fr) & np.isfinite(yvals)
+                m3 = np.isfinite(freq_simple_single) & np.isfinite(yvals)
+                panel_specs = [
+                    {
+                        "key": "non_simple_freq",
+                        "x": freq_non_simple,
+                        "mask": m1,
+                        "x_title": "non-simple events/s",
+                        "title": f"Calcium r ({lag_label}) vs non-simple event frequency",
+                        "hover_x": "non-simple freq",
+                    },
+                    {
+                        "key": "mean_fr",
+                        "x": mean_fr,
+                        "mask": m2,
+                        "x_title": "mean FR (Hz)",
+                        "title": f"Calcium r ({lag_label}) vs mean FR",
+                        "hover_x": "mean FR",
+                    },
+                    {
+                        "key": "simple_single_freq",
+                        "x": freq_simple_single,
+                        "mask": m3,
+                        "x_title": "single-simple events/s",
+                        "title": f"Calcium r ({lag_label}) vs simple single-spike event frequency",
+                        "hover_x": "simple-single freq",
+                    },
+                ]
+                fig = make_subplots(
+                    rows=1,
+                    cols=3,
+                    subplot_titles=(
+                        panel_specs[0]["title"],
+                        panel_specs[1]["title"],
+                        panel_specs[2]["title"],
+                    ),
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=freq_non_simple[m1],
+                        y=yvals[m1],
+                        mode="markers",
+                        marker=dict(color="black", size=7, opacity=0.78),
+                        text=lbl[m1],
+                        hovertemplate="%{text}<br>non-simple freq=%{x:.4g} Hz<br>calcium r=%{y:.3f}<extra></extra>",
+                        showlegend=False,
+                    ),
+                    row=1,
+                    col=1,
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=mean_fr[m2],
+                        y=yvals[m2],
+                        mode="markers",
+                        marker=dict(color="black", size=7, opacity=0.78),
+                        text=lbl[m2],
+                        hovertemplate="%{text}<br>mean FR=%{x:.4g} Hz<br>calcium r=%{y:.3f}<extra></extra>",
+                        showlegend=False,
+                    ),
+                    row=1,
+                    col=2,
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=freq_simple_single[m3],
+                        y=yvals[m3],
+                        mode="markers",
+                        marker=dict(color="black", size=7, opacity=0.78),
+                        text=lbl[m3],
+                        hovertemplate="%{text}<br>simple-single freq=%{x:.4g} Hz<br>calcium r=%{y:.3f}<extra></extra>",
+                        showlegend=False,
+                    ),
+                    row=1,
+                    col=3,
+                )
+                _add_fit_line_with_text(fig, freq_non_simple[m1], yvals[m1], row=1, col=1)
+                _add_fit_line_with_text(fig, mean_fr[m2], yvals[m2], row=1, col=2)
+                _add_fit_line_with_text(fig, freq_simple_single[m3], yvals[m3], row=1, col=3)
+                fig.update_layout(
+                    template="simple_white",
+                    width=1950,
+                    height=680,
+                    title=f"Calcium trace vs real FR | frequency scatter summary | {lag_label} | z_mode={z_mode_title_tag}",
+                    showlegend=False,
+                )
+                fig.update_xaxes(title_text="non-simple events/s", row=1, col=1)
+                fig.update_xaxes(title_text="mean FR (Hz)", row=1, col=2)
+                fig.update_xaxes(title_text="single-simple events/s", row=1, col=3)
+                fig.update_yaxes(title_text=f"calcium r ({lag_label})", row=1, col=1)
+                fig.update_yaxes(title_text=f"calcium r ({lag_label})", row=1, col=2)
+                fig.update_yaxes(title_text=f"calcium r ({lag_label})", row=1, col=3)
+                out_html = _summary_path(f"{file_stem}_{z_mode_file_tag}.html")
+                fig.write_html(out_html)
+                out_svg = None
+                if bool(save_svg):
+                    out_svg = _summary_path(f"{file_stem}_{z_mode_file_tag}.svg")
+                    try:
+                        fig.write_image(out_svg)
+                    except Exception:
+                        out_svg = None
+                panel_outputs = {}
+                for spec in panel_specs:
+                    mm = spec["mask"]
+                    xx = np.asarray(spec["x"], dtype=float)
+                    yy = np.asarray(yvals, dtype=float)
+                    fig_one = go.Figure()
+                    fig_one.add_trace(
+                        go.Scatter(
+                            x=xx[mm],
+                            y=yy[mm],
+                            mode="markers",
+                            marker=dict(color="black", size=8, opacity=0.78),
+                            text=lbl[mm],
+                            hovertemplate=(
+                                "%{text}<br>"
+                                + spec["hover_x"]
+                                + "=%{x:.4g}<br>calcium r=%{y:.3f}<extra></extra>"
+                            ),
+                            showlegend=False,
+                        )
+                    )
+                    _add_fit_line_with_text(fig_one, xx[mm], yy[mm], row=None, col=None)
+                    fig_one.update_layout(
+                        template="simple_white",
+                        width=760,
+                        height=620,
+                        title=f"{spec['title']} | z_mode={z_mode_title_tag}",
+                        showlegend=False,
+                    )
+                    fig_one.update_xaxes(title_text=spec["x_title"])
+                    fig_one.update_yaxes(title_text=f"calcium r ({lag_label})")
+                    panel_html = _summary_path(f"{file_stem}_{spec['key']}_{z_mode_file_tag}.html")
+                    fig_one.write_html(panel_html)
+                    panel_svg = None
+                    if bool(save_svg):
+                        panel_svg = _summary_path(f"{file_stem}_{spec['key']}_{z_mode_file_tag}.svg")
+                        try:
+                            fig_one.write_image(panel_svg)
+                        except Exception:
+                            panel_svg = None
+                    panel_outputs[f"{spec['key']}_html"] = panel_html
+                    panel_outputs[f"{spec['key']}_svg"] = panel_svg
+                return out_html, out_svg, panel_outputs
+
+            cal_sc3_nolag_html, cal_sc3_nolag_svg, cal_sc3_nolag_panels = _make_calcium_scatter3(
+                cal_r0,
+                lag_label="no lag correction",
+                file_stem="hist_corr_and_lag_scatter3_calcium_nolag",
+            )
+            cal_sc3_lag_html, cal_sc3_lag_svg, cal_sc3_lag_panels = _make_calcium_scatter3(
+                cal_rl,
+                lag_label="lag corrected",
+                file_stem="hist_corr_and_lag_scatter3_calcium_lag",
+            )
+            res_df.attrs["summary_hist_scatter3_calcium_nolag_html"] = cal_sc3_nolag_html
+            res_df.attrs["summary_hist_scatter3_calcium_nolag_svg"] = cal_sc3_nolag_svg
+            res_df.attrs["summary_hist_scatter3_calcium_lag_html"] = cal_sc3_lag_html
+            res_df.attrs["summary_hist_scatter3_calcium_lag_svg"] = cal_sc3_lag_svg
+            for key, val in cal_sc3_nolag_panels.items():
+                res_df.attrs[f"summary_hist_scatter3_calcium_nolag_{key}"] = val
+            for key, val in cal_sc3_lag_panels.items():
+                res_df.attrs[f"summary_hist_scatter3_calcium_lag_{key}"] = val
 
         if len(all_series_for_summary) > 0:
             # 2) All cells/state lag-corrected FR vs real FR
@@ -3393,11 +3699,11 @@ def evaluate_suite2p_spks_as_continuous_activity(
                 height=max(550, 220 * nrows),
                 title=f"All cells/states | lag-corrected fitted FR from spks vs real FR | z_mode={z_mode_title_tag}",
             )
-            all_html = os.path.join(summary_out_dir, f"all_cells_lag_corrected_fr_vs_real_{z_mode_file_tag}.html")
+            all_html = _summary_path(f"all_cells_lag_corrected_fr_vs_real_{z_mode_file_tag}.html")
             fig_all.write_html(all_html)
             all_svg = None
             if bool(save_svg):
-                all_svg = os.path.join(summary_out_dir, f"all_cells_lag_corrected_fr_vs_real_{z_mode_file_tag}.svg")
+                all_svg = _summary_path(f"all_cells_lag_corrected_fr_vs_real_{z_mode_file_tag}.svg")
                 try:
                     fig_all.write_image(all_svg)
                 except Exception:
@@ -3434,11 +3740,11 @@ def evaluate_suite2p_spks_as_continuous_activity(
                 height=max(550, 220 * nrows),
                 title=f"All cells/states | error (real FR - lag-corrected predicted FR) | z_mode={z_mode_title_tag}",
             )
-            err_html = os.path.join(summary_out_dir, f"all_cells_error_real_minus_pred_{z_mode_file_tag}.html")
+            err_html = _summary_path(f"all_cells_error_real_minus_pred_{z_mode_file_tag}.html")
             fig_err.write_html(err_html)
             err_svg = None
             if bool(save_svg):
-                err_svg = os.path.join(summary_out_dir, f"all_cells_error_real_minus_pred_{z_mode_file_tag}.svg")
+                err_svg = _summary_path(f"all_cells_error_real_minus_pred_{z_mode_file_tag}.svg")
                 try:
                     fig_err.write_image(err_svg)
                 except Exception:
@@ -3457,22 +3763,16 @@ def evaluate_suite2p_spks_as_continuous_activity(
         if np.isfinite(thr_val):
             thr_tag = f"_corrthr_{thr_val:.3f}".replace(".", "p").replace("-", "m")
 
-        all_evt_csv = os.path.join(summary_out_dir, f"all_cells_event_under_over_by_type_size{thr_tag}.csv")
+        all_evt_csv = _summary_path(f"all_cells_event_under_over_by_type_size{thr_tag}.csv")
         if len(all_evt_df) > 0:
             all_evt_csv = _safe_to_csv(all_evt_df, all_evt_csv, index=False)
         else:
             all_evt_csv = _safe_to_csv(pd.DataFrame(
                 columns=["cell_path", "cell_name", "state", "category", "event_class", "n_spikes", "cal_idx", "vol_idx"]
             ), all_evt_csv, index=False)
-        all_evt_html = os.path.join(
-            summary_out_dir,
-            f"all_cells_event_under_over_stacked_bars_{z_mode_file_tag}{thr_tag}.html",
-        )
+        all_evt_html = _summary_path(f"all_cells_event_under_over_stacked_bars_{z_mode_file_tag}{thr_tag}.html")
         all_evt_svg = (
-            os.path.join(
-                summary_out_dir,
-                f"all_cells_event_under_over_stacked_bars_{z_mode_file_tag}{thr_tag}.svg",
-            )
+            _summary_path(f"all_cells_event_under_over_stacked_bars_{z_mode_file_tag}{thr_tag}.svg")
             if bool(save_svg)
             else None
         )
@@ -3535,22 +3835,16 @@ def evaluate_suite2p_spks_as_continuous_activity(
         # Fallback pooled summary:
         # closest event within 500 ms before empty under/over window onset.
         all_evt_fb_df = pd.DataFrame(all_event_rows_closest_pre500)
-        all_evt_fb_csv = os.path.join(summary_out_dir, f"all_cells_event_under_over_closest_pre500ms_by_type_size{thr_tag}.csv")
+        all_evt_fb_csv = _summary_path(f"all_cells_event_under_over_closest_pre500ms_by_type_size{thr_tag}.csv")
         if len(all_evt_fb_df) > 0:
             all_evt_fb_csv = _safe_to_csv(all_evt_fb_df, all_evt_fb_csv, index=False)
         else:
             all_evt_fb_csv = _safe_to_csv(pd.DataFrame(
                 columns=["cell_path", "cell_name", "state", "category", "event_class", "n_spikes", "cal_idx", "vol_idx", "match_mode", "window_start_idx", "window_end_idx"]
             ), all_evt_fb_csv, index=False)
-        all_evt_fb_html = os.path.join(
-            summary_out_dir,
-            f"all_cells_event_under_over_closest_pre500ms_stacked_bars_{z_mode_file_tag}{thr_tag}.html",
-        )
+        all_evt_fb_html = _summary_path(f"all_cells_event_under_over_closest_pre500ms_stacked_bars_{z_mode_file_tag}{thr_tag}.html")
         all_evt_fb_svg = (
-            os.path.join(
-                summary_out_dir,
-                f"all_cells_event_under_over_closest_pre500ms_stacked_bars_{z_mode_file_tag}{thr_tag}.svg",
-            )
+            _summary_path(f"all_cells_event_under_over_closest_pre500ms_stacked_bars_{z_mode_file_tag}{thr_tag}.svg")
             if bool(save_svg)
             else None
         )
@@ -3588,6 +3882,8 @@ def evaluate_suite2p_spks_as_continuous_activity(
         res_df.attrs["summary_event_under_over_closest_pre500ms_html"] = all_evt_fb_html
         res_df.attrs["summary_event_under_over_closest_pre500ms_svg"] = all_evt_fb_svg
         res_df.attrs["summary_event_under_over_closest_pre500ms_csv"] = all_evt_fb_csv
+        res_df.attrs["summary_file_prefix"] = str(summary_file_prefix)
+        res_df.attrs["summary_title_label"] = str(summary_title_label)
 
     return res_df
 
@@ -3609,7 +3905,9 @@ def evaluate_cascade_as_continuous_activity(
     corrlation_thr=None,
     correlation_thr=None,
     use_cal_mask=True,
-    summary_out_dir=r"Z:\Adam-Lab-Shared\Data\Michal_Rubin\data summery\2026\Pyr\cascade_vs_realfr\countineous_aproch",
+    summary_out_dir=r"Z:\Adam-Lab-Shared\Data\Michal_Rubin\data_summery\2026\Pyr\cascade_vs_realfr\countineous_aproch",
+    summary_file_prefix="",
+    summary_title_label="CASCADE prediction",
     cascade_model_name="GC8_EXC_30Hz_smoothing50ms_high_noise",
     cascade_model_folder=None,
     cascade_threshold=0,
@@ -3713,6 +4011,8 @@ def evaluate_cascade_as_continuous_activity(
         apply_linear_scaling=apply_linear_scaling,
         use_cal_mask=use_cal_mask,
         summary_out_dir=summary_out_dir,
+        summary_file_prefix=summary_file_prefix,
+        summary_title_label=summary_title_label,
         spike_idx_offset_frames=spike_idx_offset_frames,
     )
     res_df.attrs["prediction_method"] = "CASCADE"
@@ -3724,6 +4024,8 @@ def evaluate_cascade_as_continuous_activity(
     res_df.attrs["real_fr_smoothing_sigma_s_effective"] = float(smooth_sigma_s_eff)
     res_df.attrs["cascade_model_smoothing_sigma_s_parsed"] = float(model_smooth_s) if np.isfinite(model_smooth_s) else np.nan
     res_df.attrs["cascade_errors"] = cascade_errors
+    res_df.attrs["summary_file_prefix"] = str(summary_file_prefix)
+    res_df.attrs["summary_title_label"] = str(summary_title_label)
     return res_df
 
 
@@ -3750,6 +4052,11 @@ def _attach_cascade_predictions_to_loaded_cells(
     cells_cascade = copy.deepcopy(list(loaded_cells))
     errors = []
     n_ok = 0
+    runtime_error = None
+    try:
+        _validate_cascade_runtime()
+    except Exception as exc:
+        runtime_error = str(exc)
     for cell in cells_cascade:
         if not bool(cell.get("loaded", False)):
             continue
@@ -3762,6 +4069,19 @@ def _attach_cascade_predictions_to_loaded_cells(
             if n_cal <= 0:
                 st["suite2pSpks"] = np.asarray([], dtype=float)
                 st["suite2pSpksMasked"] = np.asarray([], dtype=float)
+                continue
+            if runtime_error is not None:
+                pred = np.full(n_cal, np.nan, dtype=float)
+                errors.append(
+                    {
+                        "cell_path": str(cell.get("cell_path", "")),
+                        "state": str(st.get("state", "main")),
+                        "error": runtime_error,
+                    }
+                )
+                st["suite2pSpks"] = np.asarray(pred, dtype=float)
+                cal_mask = _normalize_bool_mask(st.get("calMask", np.ones(n_cal, dtype=bool)), n_cal)
+                st["suite2pSpksMasked"] = np.where(np.asarray(cal_mask, dtype=bool), np.asarray(pred, dtype=float), np.nan)
                 continue
             try:
                 pred = _predict_cascade_for_single_trace(
@@ -3808,6 +4128,50 @@ def _complex_like_events_from_state_pkl(pkl_data, vol_len, vol_sr):
     return out
 
 
+def _event_count_summary_from_state_pkl(pkl_data, vol_len, vol_sr):
+    try:
+        ev_list = _events_from_pkl_same_as_pyr_event_cal2(
+            pkl_data,
+            trace_len_v=int(vol_len),
+            fs_v_hz=float(vol_sr),
+            isi_ms=EVENT_ISI_MS_DEFAULT,
+        )
+    except Exception:
+        return {
+            "n_events_total": 0,
+            "n_complex_events_total": 0,
+            "complex_event_ratio": np.nan,
+            "n_simple_burst_events_total": 0,
+            "n_burst_or_complex_events_total": 0,
+            "burst_or_complex_event_ratio": np.nan,
+            "n_simple_single_events_total": 0,
+            "simple_single_event_ratio": np.nan,
+        }
+    n_total = int(len(ev_list))
+    n_complex = 0
+    n_simple_burst = 0
+    n_simple_single = 0
+    for ev in ev_list:
+        cls, n_spikes = _event_class_and_size(ev)
+        if cls == "complex":
+            n_complex += 1
+        if cls == "simple" and int(n_spikes) == 1:
+            n_simple_single += 1
+        if cls == "simple" and int(n_spikes) >= 2:
+            n_simple_burst += 1
+    n_burst_or_complex = int(n_simple_burst + n_complex)
+    return {
+        "n_events_total": n_total,
+        "n_complex_events_total": int(n_complex),
+        "complex_event_ratio": float(n_complex / n_total) if n_total > 0 else np.nan,
+        "n_simple_burst_events_total": int(n_simple_burst),
+        "n_burst_or_complex_events_total": int(n_burst_or_complex),
+        "burst_or_complex_event_ratio": float(n_burst_or_complex / n_total) if n_total > 0 else np.nan,
+        "n_simple_single_events_total": int(n_simple_single),
+        "simple_single_event_ratio": float(n_simple_single / n_total) if n_total > 0 else np.nan,
+    }
+
+
 def _build_state_true_pred_for_compare(
     cell,
     st,
@@ -3815,6 +4179,8 @@ def _build_state_true_pred_for_compare(
     max_lag_s=0.5,
     scale_pred_to_true=True,
     use_lag_correction=True,
+    fixed_prediction_lag_s=None,
+    fixed_calcium_lag_s=None,
     use_cal_mask=True,
 ):
     cal_sr = float(cell.get("cal_sr_hz", FS_CA_HZ_FALLBACK))
@@ -3882,7 +4248,11 @@ def _build_state_true_pred_for_compare(
         spks_smooth=pred_smooth,
         max_lag_frames=max_lag_frames,
     )
+    optimal_lag_frames = int(lag_frames)
     if bool(use_lag_correction):
+        if fixed_prediction_lag_s is not None and np.isfinite(fixed_prediction_lag_s):
+            lag_frames = int(round(float(fixed_prediction_lag_s) * float(cal_sr)))
+            lag_frames = int(np.clip(lag_frames, 0, max_lag_frames))
         pred_aligned = _lag_correct_prediction_after_true(pred_smooth, lag_frames)
     else:
         pred_aligned = np.asarray(pred_smooth, dtype=float)
@@ -3919,6 +4289,10 @@ def _build_state_true_pred_for_compare(
         spks_smooth=cal_smooth,
         max_lag_frames=max_lag_frames,
     )
+    optimal_cal_lag_frames = int(cal_lag_frames)
+    if fixed_calcium_lag_s is not None and np.isfinite(fixed_calcium_lag_s):
+        cal_lag_frames = int(round(float(fixed_calcium_lag_s) * float(cal_sr)))
+        cal_lag_frames = int(np.clip(cal_lag_frames, 0, max_lag_frames))
     cal_smooth_lag = _lag_correct_prediction_after_true(cal_smooth, cal_lag_frames)
     corr_calcium_vs_true_fr = _pearson_corr_valid(cal_smooth_lag, true_fr)
 
@@ -3940,6 +4314,8 @@ def _build_state_true_pred_for_compare(
         "cal_mask": np.asarray(cal_mask, dtype=bool),
         "lag_frames": int(lag_frames),
         "lag_s": float(lag_frames) / float(cal_sr),
+        "optimal_lag_frames": int(optimal_lag_frames),
+        "optimal_lag_s": float(optimal_lag_frames) / float(cal_sr),
         "corr_best_lag": float(corr_best_lag) if np.isfinite(corr_best_lag) else np.nan,
         "corr_calcium_vs_true_fr": float(corr_calcium_vs_true_fr) if np.isfinite(corr_calcium_vs_true_fr) else np.nan,
         "corr_calcium_vs_true_fr_nolag": float(corr_calcium_vs_true_fr_nolag)
@@ -3947,6 +4323,8 @@ def _build_state_true_pred_for_compare(
         else np.nan,
         "cal_best_lag_frames": int(cal_lag_frames),
         "cal_best_lag_s": float(cal_lag_frames) / float(cal_sr),
+        "cal_optimal_lag_frames": int(optimal_cal_lag_frames),
+        "cal_optimal_lag_s": float(optimal_cal_lag_frames) / float(cal_sr),
         "cal_best_lag_corr": float(corr_cal_best_lag) if np.isfinite(corr_cal_best_lag) else np.nan,
         "scale": float(scale) if np.isfinite(scale) else np.nan,
         "offset": float(offset) if np.isfinite(offset) else np.nan,
@@ -4115,6 +4493,63 @@ def _plot_complex_event_temporal_bias(
     return fig
 
 
+def _save_model_compare_bias_metric_subplots(fig, metrics, row_modes, save_html, save_svg, title):
+    """Save each panel from the model-comparison figure as standalone HTML/SVG."""
+    html_root, _ = os.path.splitext(str(save_html))
+    svg_root, _ = os.path.splitext(str(save_svg)) if save_svg else (None, None)
+    n_cols = len(metrics)
+
+    for row_idx, mode_name in enumerate(row_modes, start=1):
+        for col_idx, (metric, metric_label) in enumerate(metrics, start=1):
+            panel_idx = (row_idx - 1) * n_cols + col_idx
+            axis_suffix = "" if panel_idx == 1 else str(panel_idx)
+            target_xaxis = f"x{axis_suffix}"
+            target_yaxis = f"y{axis_suffix}"
+            panel_traces = []
+            for trace in fig.data:
+                if getattr(trace, "xaxis", "x") != target_xaxis:
+                    continue
+                trace_copy = copy.deepcopy(trace)
+                trace_copy.update(xaxis="x", yaxis="y")
+                panel_traces.append(trace_copy)
+            if not panel_traces:
+                continue
+
+            mode_label = str(mode_name) if mode_name is not None else "all"
+            panel_fig = go.Figure(data=panel_traces)
+            source_yaxis = getattr(fig.layout, f"yaxis{axis_suffix}", None)
+            yaxis_kwargs = {}
+            if source_yaxis is not None and source_yaxis.range is not None:
+                yaxis_kwargs["range"] = list(source_yaxis.range)
+            is_pearson_panel = str(metric) == "pearson_corr_true_vs_pred"
+            panel_fig.update_layout(
+                template="simple_white",
+                width=720,
+                height=640,
+                title="",
+                boxmode="group",
+                font=dict(size=16),
+                margin=dict(l=85, r=45, t=105, b=85),
+                showlegend=False,
+            )
+            panel_fig.update_xaxes(title_text=("" if is_pearson_panel else "model"))
+            panel_fig.update_yaxes(
+                title_text=("pearson correlation" if is_pearson_panel else "value"),
+                **yaxis_kwargs,
+            )
+
+            stem = f"{html_root}_subplot{panel_idx:02d}_{mode_label}_{metric}"
+            panel_html = f"{stem}.html"
+            panel_fig.write_html(panel_html)
+            if svg_root is not None:
+                try:
+                    panel_fig.write_image(
+                        f"{svg_root}_subplot{panel_idx:02d}_{mode_label}_{metric}.svg"
+                    )
+                except Exception:
+                    pass
+
+
 def _plot_model_compare_bias_metrics(metrics_df, save_html, save_svg=None, title="Model compare bias metrics"):
     metrics = [
         ("pearson_corr_true_vs_pred", "Correlation with ground truth<br>(Pearson r)"),
@@ -4158,8 +4593,12 @@ def _plot_model_compare_bias_metrics(metrics_df, save_html, save_svg=None, title
         "cascade": "#F58518",
         "cascade_unscaled": "#F58518",
         "cascade_scaled": "#C66A11",
+        "suite2p_unscaled_nolag": "rgba(76,120,168,0.38)",
+        "cascade_unscaled_nolag": "rgba(245,133,24,0.38)",
         "calcium": "#F58518",
         "calcium_trace": "#666666",
+        "calcium_trace_nolag": "#7F7F7F",
+        "calcium_trace_lag": "#444444",
     }
     fill_colors = {
         "suite2p": "rgba(76,120,168,0.28)",
@@ -4168,9 +4607,35 @@ def _plot_model_compare_bias_metrics(metrics_df, save_html, save_svg=None, title
         "cascade": "rgba(245,133,24,0.28)",
         "cascade_unscaled": "rgba(245,133,24,0.28)",
         "cascade_scaled": "rgba(198,106,17,0.32)",
+        "suite2p_unscaled_nolag": "rgba(76,120,168,0.12)",
+        "cascade_unscaled_nolag": "rgba(245,133,24,0.12)",
         "calcium": "rgba(245,133,24,0.28)",
         "calcium_trace": "rgba(120,120,120,0.28)",
+        "calcium_trace_nolag": "rgba(140,140,140,0.28)",
+        "calcium_trace_lag": "rgba(80,80,80,0.28)",
     }
+    display_names = {
+        "calcium_trace_nolag": "raw calcium",
+        "calcium_trace_lag": "calcium lag corrected",
+        "suite2p_unscaled": "suite2p",
+        "suite2p_scaled": "suite2p",
+        "cascade_unscaled": "pre-trained cascade",
+        "cascade_scaled": "pre-trained cascade",
+        "suite2p_unscaled_nolag": "suite2p no lag",
+        "cascade_unscaled_nolag": "pre-trained cascade no lag",
+    }
+    extra_model_palette = [
+        ("#54A24B", "rgba(84,162,75,0.28)"),
+        ("#B279A2", "rgba(178,121,162,0.28)"),
+        ("#E45756", "rgba(228,87,86,0.28)"),
+        ("#72B7B2", "rgba(114,183,178,0.28)"),
+    ]
+    all_model_names = sorted(set(df.get("model", pd.Series(dtype=str)).astype(str)))
+    for idx, model_name in enumerate(m for m in all_model_names if m not in {"suite2p", "cascade"}):
+        color, fill = extra_model_palette[idx % len(extra_model_palette)]
+        colors.setdefault(model_name, color)
+        fill_colors.setdefault(model_name, fill)
+    panel_mean_info = {}
     for row_idx, mode_name in enumerate(row_modes, start=1):
         if mode_name is None:
             df_row = df.copy()
@@ -4185,10 +4650,165 @@ def _plot_model_compare_bias_metrics(metrics_df, save_html, save_svg=None, title
         df_row["_base_model"] = base_model
 
         models = [m for m in ["suite2p", "cascade"] if m in set(df_row["_base_model"].astype(str))]
-        extra_models = [m for m in sorted(set(df_row["_base_model"].astype(str))) if m not in models]
+        extra_models = [
+            m for m in sorted(set(df_row["_base_model"].astype(str)))
+            if m not in models and not str(m).startswith("cascade_trained")
+        ]
         models += extra_models
 
         for col_idx, (metric, _label) in enumerate(metrics, start=1):
+            if col_idx == 1:
+                dd = df.copy() if split_rows else df_row.copy()
+                if "_base_model" not in dd.columns:
+                    if "model" in dd.columns:
+                        dd["_base_model"] = dd["model"].astype(str)
+                    else:
+                        dd["_base_model"] = (
+                            dd.get("model_display", pd.Series(index=dd.index, dtype=object))
+                            .astype(str)
+                            .str.replace(r"_(scaled|unscaled)$", "", regex=True)
+                        )
+                if "calibration_mode" not in dd.columns:
+                    dd["calibration_mode"] = np.nan
+                if ("cell_path" in dd.columns) and ("state" in dd.columns):
+                    dd = (
+                        dd.sort_values(["cell_path", "state"])
+                        .groupby(["cell_path", "state", "_base_model", "calibration_mode"], as_index=False, dropna=False)
+                        .first()
+                    )
+                corr_groups = []
+                if ("cell_path" in dd.columns) and ("state" in dd.columns):
+                    dd_calcium = (
+                        dd.sort_values(["cell_path", "state"])
+                        .groupby(["cell_path", "state"], as_index=False, dropna=False)
+                        .first()
+                    )
+                else:
+                    dd_calcium = dd.copy()
+                vals_cal_nolag = pd.to_numeric(
+                    dd_calcium.get("pearson_corr_calcium_vs_true_fr_nolag", np.nan), errors="coerce"
+                ).dropna().to_numpy(dtype=float)
+                if vals_cal_nolag.size > 0:
+                    corr_groups.append(("calcium_trace_nolag", vals_cal_nolag))
+                vals_cal_lag = pd.to_numeric(
+                    dd_calcium.get("pearson_corr_calcium_vs_true_fr", np.nan), errors="coerce"
+                ).dropna().to_numpy(dtype=float)
+                if vals_cal_lag.size > 0:
+                    corr_groups.append(("calcium_trace_lag", vals_cal_lag))
+
+                def _vals_for_model(base_model_name, calib_mode_name):
+                    use = dd.copy()
+                    if "_base_model" in use.columns:
+                        use = use[use["_base_model"].astype(str) == str(base_model_name)]
+                    if ("calibration_mode" in use.columns) and (calib_mode_name is not None):
+                        use = use[use["calibration_mode"].astype(str).str.lower() == str(calib_mode_name).lower()]
+                    return pd.to_numeric(use.get(metric, np.nan), errors="coerce").dropna().to_numpy(dtype=float)
+
+                def _vals_for_model_nolag(base_model_name, calib_mode_name):
+                    use = dd.copy()
+                    if "_base_model" in use.columns:
+                        use = use[use["_base_model"].astype(str) == str(base_model_name)]
+                    if ("calibration_mode" in use.columns) and (calib_mode_name is not None):
+                        use = use[use["calibration_mode"].astype(str).str.lower() == str(calib_mode_name).lower()]
+                    use_lag = pd.to_numeric(use.get("lag_s", np.nan), errors="coerce")
+                    use_lag_flag = use.get("use_lag_correction", pd.Series(False, index=use.index))
+                    use = use[(use_lag_flag.astype(bool)) | (np.isfinite(use_lag) & (np.abs(use_lag) > 1e-12))]
+                    return pd.to_numeric(
+                        use.get("pearson_corr_true_vs_pred_nolag", np.nan), errors="coerce"
+                    ).dropna().to_numpy(dtype=float)
+
+                vals_s2p_unscaled_nolag = _vals_for_model_nolag("suite2p", "unscaled")
+                if vals_s2p_unscaled_nolag.size > 0:
+                    corr_groups.append(("suite2p_unscaled_nolag", vals_s2p_unscaled_nolag))
+                vals_s2p_unscaled = _vals_for_model("suite2p", "unscaled")
+                if vals_s2p_unscaled.size > 0:
+                    corr_groups.append(("suite2p_unscaled", vals_s2p_unscaled))
+                # The correlation panel compares calcium, uncalibrated Suite2p,
+                # and uncalibrated CASCADE only.  Do not show the Suite2p fitted
+                # calibration here: it is a post-fit reference rather than an
+                # independent model prediction.
+                vals_cas_unscaled_nolag = _vals_for_model_nolag("cascade", "unscaled")
+                if vals_cas_unscaled_nolag.size > 0:
+                    corr_groups.append(("cascade_unscaled_nolag", vals_cas_unscaled_nolag))
+                vals_cas_unscaled = _vals_for_model("cascade", "unscaled")
+                if vals_cas_unscaled.size > 0:
+                    corr_groups.append(("cascade_unscaled", vals_cas_unscaled))
+                for extra_model in sorted(
+                    m for m in set(dd["_base_model"].astype(str))
+                    if m not in {"suite2p", "cascade"} and not str(m).startswith("cascade_trained")
+                ):
+                    vals_extra_unscaled = _vals_for_model(extra_model, "unscaled")
+                    if vals_extra_unscaled.size > 0:
+                        corr_groups.append((extra_model, vals_extra_unscaled))
+
+                if len(corr_groups) == 0:
+                    # Fallback for older single-mode outputs without calibration_mode.
+                    for model in models:
+                        vals = pd.to_numeric(
+                            df_row.loc[df_row["_base_model"].astype(str) == model, metric],
+                            errors="coerce",
+                        ).dropna().to_numpy(dtype=float)
+                        if vals.size > 0:
+                            corr_groups.append((model, vals))
+
+                panel_mean_info[(row_idx, col_idx)] = [
+                    (display_names.get(group_name, group_name), vals, colors.get(group_name, "#777777"))
+                    for group_name, vals in corr_groups
+                ]
+                for group_name, vals in corr_groups:
+                    group_label = display_names.get(group_name, group_name)
+                    group_color = colors.get(group_name, "#777777")
+                    fig.add_trace(
+                        go.Violin(
+                            y=vals,
+                            x=[group_label] * int(vals.size),
+                            name=group_label,
+                            legendgroup=group_name,
+                            showlegend=(row_idx == 1),
+                            points="all",
+                            pointpos=0,
+                            jitter=0.48,
+                            width=0.52,
+                            box_visible=True,
+                            meanline_visible=True,
+                            marker=dict(
+                                size=6,
+                                opacity=(0.42 if str(group_name).endswith("_nolag") else 0.78),
+                                color=group_color,
+                                line=dict(color="rgba(0,0,0,0.45)", width=0.6),
+                            ),
+                            line=dict(color=group_color),
+                            fillcolor=fill_colors.get(group_name, "rgba(119,119,119,0.28)"),
+                            opacity=1.0,
+                        ),
+                        row=row_idx,
+                        col=col_idx,
+                    )
+                    vals_finite = np.asarray(vals, dtype=float)
+                    vals_finite = vals_finite[np.isfinite(vals_finite)]
+                    if vals_finite.size > 0:
+                        fig.add_trace(
+                            go.Scatter(
+                                x=[group_label],
+                                y=[float(np.nanmean(vals_finite))],
+                                mode="markers",
+                                marker=dict(
+                                    symbol="line-ew",
+                                    size=42,
+                                    color=group_color,
+                                    line=dict(color="black", width=2.2),
+                                ),
+                                name=f"{group_label} mean",
+                                legendgroup=group_name,
+                                showlegend=False,
+                                hovertemplate=f"{group_label}<br>mean=%{{y:.3f}}<extra></extra>",
+                            ),
+                            row=row_idx,
+                            col=col_idx,
+                        )
+                fig.update_xaxes(title_text="model", row=row_idx, col=col_idx)
+                continue
+
             for model in models:
                 vals = pd.to_numeric(
                     df_row.loc[df_row["_base_model"].astype(str) == model, metric],
@@ -4196,6 +4816,9 @@ def _plot_model_compare_bias_metrics(metrics_df, save_html, save_svg=None, title
                 ).dropna().to_numpy(dtype=float)
                 if vals.size == 0:
                     continue
+                panel_mean_info.setdefault((row_idx, col_idx), []).append(
+                    (str(model), vals, colors.get(model, "#777777"))
+                )
                 fig.add_trace(
                     go.Box(
                         y=vals,
@@ -4218,47 +4841,47 @@ def _plot_model_compare_bias_metrics(metrics_df, save_html, save_svg=None, title
                         fillcolor=fill_colors.get(model, "rgba(119,119,119,0.28)"),
                         opacity=1.0,
                     ),
-                    row=row_idx,
-                    col=col_idx,
-                )
-
-            # Merge calcium-vs-true-FR correlation into first panel of each row.
-            if col_idx == 1:
-                dd = df_row.copy()
-                if ("cell_path" in dd.columns) and ("state" in dd.columns):
-                    dd = (
-                        dd.sort_values(["cell_path", "state"])
-                        .groupby(["cell_path", "state"], as_index=False)
-                        .first()
-                    )
-                vals_cal = pd.to_numeric(dd.get("pearson_corr_calcium_vs_true_fr", np.nan), errors="coerce").dropna().to_numpy(dtype=float)
-                if vals_cal.size > 0:
-                    fig.add_trace(
-                        go.Box(
-                            y=vals_cal,
-                            x=["calcium_trace"] * int(vals_cal.size),
-                            name="calcium_trace",
-                            legendgroup="calcium_trace",
-                            showlegend=(row_idx == 1),
-                            boxpoints="all",
-                            pointpos=0,
-                            jitter=0.48,
-                            width=0.52,
-                            boxmean=True,
-                            marker=dict(
-                                size=6,
-                                opacity=0.78,
-                                color="#666666",
-                                line=dict(color="rgba(0,0,0,0.45)", width=0.6),
-                            ),
-                            line=dict(color="#444444"),
-                            fillcolor="rgba(120,120,120,0.28)",
-                            opacity=1.0,
-                        ),
                         row=row_idx,
                         col=col_idx,
                     )
             fig.update_xaxes(title_text="model", row=row_idx, col=col_idx)
+
+    for (row_idx, col_idx), entries in panel_mean_info.items():
+        if len(entries) == 0:
+            continue
+        all_vals = []
+        for _name, vals, _color in entries:
+            vv = np.asarray(vals, dtype=float)
+            vv = vv[np.isfinite(vv)]
+            if vv.size > 0:
+                all_vals.append(vv)
+        if len(all_vals) == 0:
+            continue
+        merged = np.concatenate(all_vals)
+        ymin = float(np.nanmin(merged))
+        ymax = float(np.nanmax(merged))
+        yr = ymax - ymin
+        if not np.isfinite(yr) or yr <= 0:
+            yr = max(abs(ymax), 1.0) * 0.15
+        y_text = ymax + 0.08 * yr
+        fig.update_yaxes(range=[ymin, ymax + 0.18 * yr], row=row_idx, col=col_idx)
+        for x_idx, (name, vals, color) in enumerate(entries, start=1):
+            vv = np.asarray(vals, dtype=float)
+            vv = vv[np.isfinite(vv)]
+            if vv.size == 0:
+                continue
+            m = float(np.nanmean(vv))
+            fig.add_annotation(
+                x=str(name),
+                y=y_text,
+                xref=f"x{'' if (row_idx == 1 and col_idx == 1) else ((row_idx - 1) * len(metrics) + col_idx)}",
+                yref=f"y{'' if (row_idx == 1 and col_idx == 1) else ((row_idx - 1) * len(metrics) + col_idx)}",
+                text=f"{m:.2f}",
+                showarrow=False,
+                xanchor="center",
+                yanchor="bottom",
+                font=dict(size=11, color=str(color)),
+            )
 
     fig.update_yaxes(title_text="value", row=1, col=1)
     if split_rows:
@@ -4279,6 +4902,849 @@ def _plot_model_compare_bias_metrics(metrics_df, save_html, save_svg=None, title
             fig.write_image(save_svg)
         except Exception:
             pass
+    _save_model_compare_bias_metric_subplots(
+        fig,
+        metrics=metrics,
+        row_modes=row_modes,
+        save_html=save_html,
+        save_svg=save_svg,
+        title=title,
+    )
+    return fig
+
+
+def _plot_model_compare_corr_vs_fr_stats(
+    metrics_df,
+    save_html,
+    save_svg=None,
+    title="Model compare correlation vs FR statistics",
+    methods_to_include=None,
+):
+    """Plot model correlation against real-FR summary statistics."""
+    if metrics_df is None or len(metrics_df) == 0:
+        return None
+    df = metrics_df.copy()
+    if "ok" in df.columns:
+        df = df[df["ok"] == True].copy()
+    if len(df) == 0:
+        return None
+
+    x_specs = [
+        ("mean_true_fr_hz", "Mean FR (Hz)"),
+        ("std_true_fr_hz", "FR STD (Hz)"),
+        ("var_true_fr_hz2", "FR variance"),
+        ("cv_true_fr", "CV_FR"),
+        ("fano_true_fr", "Fano factor"),
+        ("complex_event_ratio", "Complex / total events"),
+        ("burst_or_complex_event_ratio", "Simple burst + complex / total events"),
+        ("simple_single_event_ratio", "Single-spike simple / total events"),
+        ("simple_single_event_rate_hz", "Single-spike simple event rate (Hz)"),
+        ("simple_burst_event_rate_hz", "Simple burst event rate (Hz)"),
+        ("complex_event_rate_hz", "Complex event rate (Hz)"),
+    ]
+    if not all(col in df.columns for col, _label in x_specs):
+        return None
+
+    records = []
+    for _, row in df.iterrows():
+        model = str(row.get("model", "model"))
+        if model.startswith("cascade_trained"):
+            continue
+        y = pd.to_numeric(row.get("pearson_corr_true_vs_pred", np.nan), errors="coerce")
+        if not np.isfinite(y):
+            continue
+        mode = str(row.get("calibration_mode", "")).strip().lower()
+        method = f"{model}_{mode}" if mode and mode != "nan" else model
+        rec = {
+            "cell_path": str(row.get("cell_path", "")),
+            "state": str(row.get("state", "")),
+            "method": method,
+            "pearson_r": float(y),
+        }
+        for col, _label in x_specs:
+            rec[col] = pd.to_numeric(row.get(col, np.nan), errors="coerce")
+        records.append(rec)
+        model_l = str(model).strip().lower()
+        y_nolag = pd.to_numeric(row.get("pearson_corr_true_vs_pred_nolag", np.nan), errors="coerce")
+        use_lag = bool(row.get("use_lag_correction", False))
+        lag_s = pd.to_numeric(row.get("lag_s", np.nan), errors="coerce")
+        if (
+            np.isfinite(y_nolag)
+            and (model_l == "suite2p" or model_l == "cascade" or model_l.startswith("cascade_"))
+            and (use_lag or (np.isfinite(lag_s) and abs(float(lag_s)) > 1e-12))
+        ):
+            rec_nolag = rec.copy()
+            rec_nolag["method"] = f"{method}_nolag"
+            rec_nolag["pearson_r"] = float(y_nolag)
+            records.append(rec_nolag)
+
+    if "cell_path" in df.columns and "state" in df.columns:
+        calcium_df = (
+            df.sort_values(["cell_path", "state"])
+            .groupby(["cell_path", "state"], as_index=False, dropna=False)
+            .first()
+        )
+        for calcium_col, method in [
+            ("pearson_corr_calcium_vs_true_fr_nolag", "calcium_trace_nolag"),
+            ("pearson_corr_calcium_vs_true_fr", "calcium_trace_lag"),
+        ]:
+            if calcium_col not in calcium_df.columns:
+                continue
+            for _, row in calcium_df.iterrows():
+                y = pd.to_numeric(row.get(calcium_col, np.nan), errors="coerce")
+                if not np.isfinite(y):
+                    continue
+                rec = {
+                    "cell_path": str(row.get("cell_path", "")),
+                    "state": str(row.get("state", "")),
+                    "method": method,
+                    "pearson_r": float(y),
+                }
+                for col, _label in x_specs:
+                    rec[col] = pd.to_numeric(row.get(col, np.nan), errors="coerce")
+                records.append(rec)
+
+    plot_df = pd.DataFrame(records)
+    if len(plot_df) == 0:
+        return None
+    if methods_to_include is not None:
+        wanted = {str(method) for method in methods_to_include}
+        plot_df = plot_df[plot_df["method"].astype(str).isin(wanted)].copy()
+        if len(plot_df) == 0:
+            return None
+
+    method_order = [
+        "calcium_trace_nolag",
+        "calcium_trace_lag",
+        "suite2p_unscaled_nolag",
+        "suite2p_unscaled",
+        "suite2p_scaled_nolag",
+        "suite2p_scaled",
+        "cascade_unscaled_nolag",
+        "cascade_unscaled",
+        "cascade_scaled_nolag",
+        "cascade_scaled",
+    ]
+    existing_methods = [m for m in method_order if m in set(plot_df["method"].astype(str))]
+    existing_methods += [m for m in sorted(set(plot_df["method"].astype(str))) if m not in existing_methods]
+    colors = {
+        "calcium_trace_nolag": "#7F7F7F",
+        "calcium_trace_lag": "#444444",
+        "suite2p_unscaled": "#4C78A8",
+        "suite2p_scaled": "#2F5E91",
+        "cascade_unscaled": "#F58518",
+        "cascade_scaled": "#C66A11",
+    }
+    def _hex_to_rgba(color, alpha=0.36):
+        color = str(color)
+        if color.startswith("#") and len(color) == 7:
+            r = int(color[1:3], 16)
+            g = int(color[3:5], 16)
+            b = int(color[5:7], 16)
+            return f"rgba({r},{g},{b},{float(alpha):.3g})"
+        return color
+
+    for _base_method in ["suite2p_unscaled", "suite2p_scaled", "cascade_unscaled", "cascade_scaled"]:
+        colors[f"{_base_method}_nolag"] = _hex_to_rgba(colors[_base_method], 0.34)
+    display_names = {
+        "calcium_trace_nolag": "raw calcium",
+        "calcium_trace_lag": "calcium lag corrected",
+        "suite2p_unscaled": "suite2p",
+        "suite2p_scaled": "suite2p",
+        "cascade_unscaled": "pre-trained cascade",
+        "cascade_scaled": "pre-trained cascade",
+        "suite2p_unscaled_nolag": "suite2p no lag",
+        "suite2p_scaled_nolag": "suite2p no lag",
+        "cascade_unscaled_nolag": "pre-trained cascade no lag",
+        "cascade_scaled_nolag": "pre-trained cascade no lag",
+    }
+    fallback_colors = ["#54A24B", "#B279A2", "#E45756", "#72B7B2", "#9D755D"]
+    for idx, method in enumerate(m for m in existing_methods if m not in colors):
+        colors[method] = fallback_colors[idx % len(fallback_colors)]
+
+    try:
+        from scipy import stats as _scipy_stats
+    except Exception:
+        _scipy_stats = None
+
+    def _pearson_r_p(x, y):
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        mask = np.isfinite(x) & np.isfinite(y)
+        if int(np.sum(mask)) < 3 or float(np.nanstd(x[mask])) <= 0 or float(np.nanstd(y[mask])) <= 0:
+            return np.nan, np.nan
+        if _scipy_stats is not None:
+            res = _scipy_stats.pearsonr(x[mask], y[mask])
+            if hasattr(res, "statistic"):
+                return float(res.statistic), float(res.pvalue)
+            return float(res[0]), float(res[1])
+        return float(np.corrcoef(x[mask], y[mask])[0, 1]), np.nan
+
+    def _format_r_p(r_value, p_value):
+        r_text = "r=NA" if not np.isfinite(r_value) else f"r={r_value:.2f}"
+        if not np.isfinite(p_value):
+            p_text = "p=NA"
+        elif p_value < 1e-4:
+            p_text = f"p={p_value:.1e}"
+        else:
+            p_text = f"p={p_value:.3f}"
+        return f"{r_text}<br>{p_text}"
+
+    n_cols = 3
+    n_rows = int(math.ceil(len(x_specs) / n_cols))
+    fig = make_subplots(
+        rows=n_rows,
+        cols=n_cols,
+        subplot_titles=[label for _col, label in x_specs],
+        horizontal_spacing=0.10,
+        vertical_spacing=0.13,
+    )
+
+    def _add_fit_line(_fig, x, y, row, col, color, annotation_y=0.04):
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        mask = np.isfinite(x) & np.isfinite(y)
+        if int(np.sum(mask)) < 3 or float(np.nanstd(x[mask])) <= 0:
+            return
+        slope, intercept = np.polyfit(x[mask], y[mask], 1)
+        xs = np.linspace(float(np.nanmin(x[mask])), float(np.nanmax(x[mask])), 100)
+        ys = slope * xs + intercept
+        r, p = _pearson_r_p(x[mask], y[mask])
+        _fig.add_trace(
+            go.Scatter(
+                x=xs,
+                y=ys,
+                mode="lines",
+                line=dict(color=color, width=1.5),
+                showlegend=False,
+                hoverinfo="skip",
+            ),
+            row=row,
+            col=col,
+        )
+        _fig.add_annotation(
+            x=0.98,
+            y=annotation_y,
+            xref=f"x{'' if (row == 1 and col == 1) else ((row - 1) * n_cols + col)} domain",
+            yref=f"y{'' if (row == 1 and col == 1) else ((row - 1) * n_cols + col)} domain",
+            text=_format_r_p(r, p),
+            showarrow=False,
+            xanchor="right",
+            yanchor="bottom",
+            font=dict(size=11, color=color),
+        )
+
+    for panel_idx, (x_col, x_label) in enumerate(x_specs):
+        row_idx = panel_idx // n_cols + 1
+        col_idx = panel_idx % n_cols + 1
+        for method_idx, method in enumerate(existing_methods):
+            sub = plot_df[plot_df["method"].astype(str) == str(method)].copy()
+            x = pd.to_numeric(sub[x_col], errors="coerce").to_numpy(dtype=float)
+            y = pd.to_numeric(sub["pearson_r"], errors="coerce").to_numpy(dtype=float)
+            mask = np.isfinite(x) & np.isfinite(y)
+            if int(np.sum(mask)) == 0:
+                continue
+            hover = (
+                sub.loc[mask, "cell_path"].astype(str)
+                + "<br>state="
+                + sub.loc[mask, "state"].astype(str)
+                + "<br>method="
+                + display_names.get(str(method), str(method))
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=x[mask],
+                    y=y[mask],
+                    mode="markers",
+                    name=display_names.get(str(method), str(method)),
+                    legendgroup=str(method),
+                    showlegend=(panel_idx == 0),
+                    marker=dict(
+                        size=7,
+                        opacity=(0.42 if str(method).endswith("_nolag") else 0.78),
+                        color=colors.get(method, "#777777"),
+                        line=dict(color="rgba(0,0,0,0.45)", width=0.5),
+                    ),
+                    text=hover,
+                    hovertemplate="%{text}<br>x=%{x:.4g}<br>r=%{y:.3f}<extra></extra>",
+                ),
+                row=row_idx,
+                col=col_idx,
+            )
+            _add_fit_line(
+                fig,
+                x[mask],
+                y[mask],
+                row_idx,
+                col_idx,
+                colors.get(method, "#777777"),
+                annotation_y=0.04 + 0.065 * method_idx,
+            )
+        fig.update_xaxes(title_text=x_label, row=row_idx, col=col_idx)
+        fig.update_yaxes(title_text="Pearson r", row=row_idx, col=col_idx)
+
+    fig.update_layout(
+        template="simple_white",
+        width=1250,
+        height=900,
+        title=title,
+        font=dict(size=15),
+        margin=dict(l=85, r=45, t=115, b=80),
+    )
+    os.makedirs(os.path.dirname(save_html), exist_ok=True)
+    fig.write_html(save_html)
+    if save_svg is not None:
+        try:
+            fig.write_image(save_svg)
+        except Exception:
+            pass
+    html_root, _html_ext = os.path.splitext(str(save_html))
+    svg_root, _svg_ext = os.path.splitext(str(save_svg)) if save_svg is not None else (None, None)
+    for panel_idx, (x_col, x_label) in enumerate(x_specs, start=1):
+        panel_fig = go.Figure()
+        for method_idx, method in enumerate(existing_methods):
+            sub = plot_df[plot_df["method"].astype(str) == str(method)].copy()
+            x = pd.to_numeric(sub[x_col], errors="coerce").to_numpy(dtype=float)
+            y = pd.to_numeric(sub["pearson_r"], errors="coerce").to_numpy(dtype=float)
+            mask = np.isfinite(x) & np.isfinite(y)
+            if int(np.sum(mask)) == 0:
+                continue
+            hover = (
+                sub.loc[mask, "cell_path"].astype(str)
+                + "<br>state="
+                + sub.loc[mask, "state"].astype(str)
+                + "<br>method="
+                + display_names.get(str(method), str(method))
+            )
+            panel_fig.add_trace(
+                go.Scatter(
+                    x=x[mask],
+                    y=y[mask],
+                    mode="markers",
+                    name=display_names.get(str(method), str(method)),
+                    legendgroup=str(method),
+                    marker=dict(
+                        size=7,
+                        opacity=(0.42 if str(method).endswith("_nolag") else 0.78),
+                        color=colors.get(method, "#777777"),
+                        line=dict(color="rgba(0,0,0,0.45)", width=0.5),
+                    ),
+                    text=hover,
+                    hovertemplate="%{text}<br>x=%{x:.4g}<br>r=%{y:.3f}<extra></extra>",
+                )
+            )
+            x_fit = x[mask]
+            y_fit = y[mask]
+            if int(np.sum(np.isfinite(x_fit) & np.isfinite(y_fit))) >= 3 and float(np.nanstd(x_fit)) > 0:
+                slope, intercept = np.polyfit(x_fit, y_fit, 1)
+                xs = np.linspace(float(np.nanmin(x_fit)), float(np.nanmax(x_fit)), 100)
+                ys = slope * xs + intercept
+                r, p = _pearson_r_p(x_fit, y_fit)
+                panel_fig.add_trace(
+                    go.Scatter(
+                        x=xs,
+                        y=ys,
+                        mode="lines",
+                        name=f"{display_names.get(str(method), str(method))} fit",
+                        legendgroup=str(method),
+                        line=dict(color=colors.get(method, "#777777"), width=1.5),
+                        hoverinfo="skip",
+                    )
+                )
+                panel_fig.add_annotation(
+                    x=0.98,
+                    y=0.04 + 0.065 * method_idx,
+                    xref="paper",
+                    yref="paper",
+                    text=_format_r_p(r, p),
+                    showarrow=False,
+                    xanchor="right",
+                    yanchor="bottom",
+                    font=dict(size=12, color=colors.get(method, "#777777")),
+                )
+        safe_key = re.sub(r"[^A-Za-z0-9]+", "_", str(x_col)).strip("_").lower()
+        panel_fig.update_layout(
+            template="simple_white",
+            width=760,
+            height=620,
+            title="",
+            font=dict(size=15),
+            margin=dict(l=85, r=45, t=105, b=80),
+            showlegend=False,
+        )
+        panel_fig.update_xaxes(title_text=x_label)
+        panel_fig.update_yaxes(title_text="Pearson r")
+        panel_html = f"{html_root}_subplot{panel_idx:02d}_{safe_key}.html"
+        panel_fig.write_html(panel_html)
+        if svg_root is not None:
+            try:
+                panel_fig.write_image(f"{svg_root}_subplot{panel_idx:02d}_{safe_key}.svg")
+            except Exception:
+                pass
+    return fig
+
+
+def _plot_model_compare_lag_histograms(
+    metrics_df,
+    save_html,
+    save_svg=None,
+    title="Chosen lag histogram",
+):
+    """Save histograms of selected lag per cell for calcium and model traces."""
+    if metrics_df is None or len(metrics_df) == 0:
+        return None
+    df = metrics_df.copy()
+    if "ok" in df.columns:
+        df = df[df["ok"] == True].copy()
+    if len(df) == 0:
+        return None
+
+    fig = make_subplots(
+        rows=1,
+        cols=2,
+        subplot_titles=(
+            "Calcium chosen lag per cell",
+            "Model chosen lag per cell",
+        ),
+        horizontal_spacing=0.13,
+    )
+
+    cal_lag_ms = np.array([], dtype=float)
+    model_lag_ms_by_model = {}
+
+    if {"cell_path", "state"}.issubset(df.columns) and (
+        "calcium_optimal_lag_s" in df.columns or "calcium_best_lag_s" in df.columns
+    ):
+        cal_df = (
+            df.sort_values(["cell_path", "state"])
+            .groupby(["cell_path", "state"], as_index=False, dropna=False)
+            .first()
+        )
+        cal_lag_col = "calcium_optimal_lag_s" if "calcium_optimal_lag_s" in cal_df.columns else "calcium_best_lag_s"
+        cal_lag_ms = 1000.0 * pd.to_numeric(
+            cal_df[cal_lag_col], errors="coerce"
+        ).to_numpy(dtype=float)
+        cal_lag_ms = cal_lag_ms[np.isfinite(cal_lag_ms)]
+        if cal_lag_ms.size:
+            fig.add_trace(
+                go.Histogram(
+                    x=cal_lag_ms,
+                    name=f"calcium (n={cal_lag_ms.size})",
+                    marker=dict(color="#444444", line=dict(color="black", width=1)),
+                    opacity=0.75,
+                    showlegend=False,
+                    hovertemplate="calcium lag=%{x:.1f} ms<br># cells=%{y}<extra></extra>",
+                ),
+                    row=1,
+                    col=1,
+                )
+            fixed_cal_lag_ms = 1000.0 * pd.to_numeric(
+                cal_df.get("fixed_calcium_lag_s", np.nan), errors="coerce"
+            ).to_numpy(dtype=float)
+            fixed_cal_lag_ms = fixed_cal_lag_ms[np.isfinite(fixed_cal_lag_ms)]
+            line_x = float(np.nanmedian(fixed_cal_lag_ms)) if fixed_cal_lag_ms.size else float(np.nanmedian(cal_lag_ms))
+            fig.add_vline(
+                x=line_x,
+                line_color="#800000",
+                line_dash="dash",
+                line_width=2,
+                row=1,
+                col=1,
+            )
+
+    if {"cell_path", "state", "model"}.issubset(df.columns) and (
+        "optimal_lag_s" in df.columns or "lag_s" in df.columns
+    ):
+        lag_df = df.copy()
+        lag_df["model"] = lag_df["model"].astype(str)
+        lag_df = lag_df[~lag_df["model"].str.startswith("cascade_trained")].copy()
+        lag_df = (
+            lag_df.sort_values(["cell_path", "state", "model"])
+            .groupby(["cell_path", "state", "model"], as_index=False, dropna=False)
+            .first()
+        )
+        colors = {"suite2p": "#4C78A8", "cascade": "#F58518"}
+        names = {"suite2p": "suite2p", "cascade": "pre-trained cascade"}
+        for model in [m for m in ["suite2p", "cascade"] if m in set(lag_df["model"])]:
+            lag_col = "optimal_lag_s" if "optimal_lag_s" in lag_df.columns else "lag_s"
+            vals = 1000.0 * pd.to_numeric(
+                lag_df.loc[lag_df["model"] == model, lag_col], errors="coerce"
+            ).to_numpy(dtype=float)
+            vals = vals[np.isfinite(vals)]
+            if vals.size == 0:
+                continue
+            model_lag_ms_by_model[model] = vals
+            fig.add_trace(
+                go.Histogram(
+                    x=vals,
+                    name=f"{names.get(model, model)} (n={vals.size})",
+                    marker=dict(color=colors.get(model, "#777777"), line=dict(color="black", width=1)),
+                    opacity=0.58,
+                    showlegend=True,
+                    hovertemplate=f"{names.get(model, model)} lag=%{{x:.1f}} ms<br># cells=%{{y}}<extra></extra>",
+                ),
+                row=1,
+                col=2,
+            )
+            fixed_model_lag_ms = 1000.0 * pd.to_numeric(
+                lag_df.loc[lag_df["model"] == model, "fixed_model_lag_s"]
+                if "fixed_model_lag_s" in lag_df.columns
+                else np.nan,
+                errors="coerce",
+            ).to_numpy(dtype=float)
+            fixed_model_lag_ms = fixed_model_lag_ms[np.isfinite(fixed_model_lag_ms)]
+            line_x = float(np.nanmedian(fixed_model_lag_ms)) if fixed_model_lag_ms.size else float(np.nanmedian(vals))
+            fig.add_vline(
+                x=line_x,
+                line_color="#800000",
+                line_dash="dash",
+                line_width=2,
+                row=1,
+                col=2,
+            )
+
+    fig.update_xaxes(title_text="best lag (ms)", row=1, col=1)
+    fig.update_xaxes(title_text="best lag (ms)", row=1, col=2)
+    fig.update_yaxes(title_text="# cells", row=1, col=1)
+    fig.update_yaxes(title_text="# cells", row=1, col=2)
+    fig.update_layout(
+        template="simple_white",
+        width=1100,
+        height=520,
+        title="",
+        barmode="overlay",
+        font=dict(size=15),
+        margin=dict(l=85, r=45, t=70, b=75),
+    )
+
+    os.makedirs(os.path.dirname(save_html), exist_ok=True)
+    fig.write_html(save_html)
+    if save_svg is not None:
+        try:
+            fig.write_image(save_svg)
+        except Exception:
+            pass
+
+    html_root, _html_ext = os.path.splitext(str(save_html))
+    svg_root, _svg_ext = os.path.splitext(str(save_svg)) if save_svg is not None else (None, None)
+
+    if cal_lag_ms.size:
+        panel_fig = go.Figure()
+        panel_fig.add_trace(
+            go.Histogram(
+                x=cal_lag_ms,
+                marker=dict(color="#444444", line=dict(color="black", width=1)),
+                opacity=0.75,
+                showlegend=False,
+                hovertemplate="calcium lag=%{x:.1f} ms<br># cells=%{y}<extra></extra>",
+            )
+        )
+        panel_fig.add_vline(
+            x=float(np.nanmedian(cal_lag_ms)),
+            line_color="red",
+            line_dash="dash",
+            line_width=2,
+        )
+        panel_fig.update_layout(
+            template="simple_white",
+            width=620,
+            height=520,
+            title="",
+            barmode="overlay",
+            font=dict(size=15),
+            margin=dict(l=85, r=45, t=45, b=75),
+            showlegend=False,
+        )
+        panel_fig.update_xaxes(title_text="optimal lag (ms)")
+        panel_fig.update_yaxes(title_text="# cells")
+        panel_fig.write_html(f"{html_root}_subplot01_calcium_optimal_lag.html")
+        if svg_root is not None:
+            try:
+                panel_fig.write_image(f"{svg_root}_subplot01_calcium_optimal_lag.svg")
+            except Exception:
+                pass
+
+    if model_lag_ms_by_model:
+        panel_fig = go.Figure()
+        for model, vals in model_lag_ms_by_model.items():
+            panel_fig.add_trace(
+                go.Histogram(
+                    x=vals,
+                    marker=dict(color=colors.get(model, "#777777"), line=dict(color="black", width=1)),
+                    opacity=0.58,
+                    showlegend=False,
+                    hovertemplate=f"{names.get(model, model)} lag=%{{x:.1f}} ms<br># cells=%{{y}}<extra></extra>",
+                )
+            )
+            panel_fig.add_vline(
+                x=float(np.nanmedian(vals)),
+                line_color=colors.get(model, "#777777"),
+                line_dash="dash",
+                line_width=2,
+            )
+        panel_fig.update_layout(
+            template="simple_white",
+            width=620,
+            height=520,
+            title="",
+            barmode="overlay",
+            font=dict(size=15),
+            margin=dict(l=85, r=45, t=45, b=75),
+            showlegend=False,
+        )
+        panel_fig.update_xaxes(title_text="optimal lag (ms)")
+        panel_fig.update_yaxes(title_text="# cells")
+        panel_fig.write_html(f"{html_root}_subplot02_model_optimal_lag.html")
+        if svg_root is not None:
+            try:
+                panel_fig.write_image(f"{svg_root}_subplot02_model_optimal_lag.svg")
+            except Exception:
+                pass
+    return fig
+
+
+def _standardize_for_partial_r2(x):
+    x = np.asarray(x, dtype=float).ravel()
+    mu = np.nanmean(x)
+    sd = np.nanstd(x)
+    if (not np.isfinite(sd)) or sd <= 0:
+        return np.full_like(x, np.nan, dtype=float)
+    return (x - mu) / sd
+
+
+def _ols_r2_for_partial_r2(y, X):
+    y = np.asarray(y, dtype=float).ravel()
+    X = np.asarray(X, dtype=float)
+    if X.ndim == 1:
+        X = X.reshape(-1, 1)
+    ok = np.isfinite(y)
+    if X.size:
+        ok &= np.all(np.isfinite(X), axis=1)
+    if int(np.sum(ok)) < max(6, X.shape[1] + 3):
+        return np.nan, int(np.sum(ok))
+    yy = y[ok]
+    XX = X[ok] if X.size else np.empty((yy.size, 0), dtype=float)
+    XX = np.column_stack([np.ones(yy.size), XX])
+    try:
+        beta, *_ = np.linalg.lstsq(XX, yy, rcond=None)
+        pred = XX @ beta
+    except Exception:
+        return np.nan, int(yy.size)
+    ss_res = float(np.nansum((yy - pred) ** 2))
+    ss_tot = float(np.nansum((yy - np.nanmean(yy)) ** 2))
+    if ss_tot <= 0:
+        return np.nan, int(yy.size)
+    return float(1.0 - ss_res / ss_tot), int(yy.size)
+
+
+def _plot_model_compare_fr_driver_partial_r2(
+    metrics_df,
+    save_html,
+    save_svg=None,
+    title="FR driver partial R²",
+    methods_to_include=None,
+):
+    """Compare FR/event metrics as predictors of model correlation."""
+    if metrics_df is None or len(metrics_df) == 0:
+        return None
+    df = metrics_df.copy()
+    if "ok" in df.columns:
+        df = df[df["ok"] == True].copy()
+    required = {
+        "cell_path",
+        "state",
+        "mean_true_fr_hz",
+        "var_true_fr_hz2",
+        "cv_true_fr",
+        "complex_event_ratio",
+        "burst_or_complex_event_ratio",
+        "simple_single_event_ratio",
+    }
+    if len(df) == 0 or not required.issubset(df.columns):
+        return None
+
+    records = []
+    for _, row in df.iterrows():
+        model = str(row.get("model", "model"))
+        if model.startswith("cascade_trained"):
+            continue
+        y = pd.to_numeric(row.get("pearson_corr_true_vs_pred", np.nan), errors="coerce")
+        if not np.isfinite(y):
+            continue
+        mode = str(row.get("calibration_mode", "")).strip().lower()
+        method = f"{model}_{mode}" if mode and mode != "nan" else model
+        records.append(
+            {
+                "method": method,
+                "pearson_r": float(y),
+                "mean_true_fr_hz": pd.to_numeric(row.get("mean_true_fr_hz", np.nan), errors="coerce"),
+                "var_true_fr_hz2": pd.to_numeric(row.get("var_true_fr_hz2", np.nan), errors="coerce"),
+                "cv_true_fr": pd.to_numeric(row.get("cv_true_fr", np.nan), errors="coerce"),
+                "complex_event_ratio": pd.to_numeric(row.get("complex_event_ratio", np.nan), errors="coerce"),
+                "burst_or_complex_event_ratio": pd.to_numeric(row.get("burst_or_complex_event_ratio", np.nan), errors="coerce"),
+                "simple_single_event_ratio": pd.to_numeric(row.get("simple_single_event_ratio", np.nan), errors="coerce"),
+            }
+        )
+
+    calcium_df = (
+        df.sort_values(["cell_path", "state"])
+        .groupby(["cell_path", "state"], as_index=False, dropna=False)
+        .first()
+    )
+    for calcium_col, method in [
+        ("pearson_corr_calcium_vs_true_fr_nolag", "calcium_trace_nolag"),
+        ("pearson_corr_calcium_vs_true_fr", "calcium_trace_lag"),
+    ]:
+        if calcium_col not in calcium_df.columns:
+            continue
+        for _, row in calcium_df.iterrows():
+            y = pd.to_numeric(row.get(calcium_col, np.nan), errors="coerce")
+            if not np.isfinite(y):
+                continue
+            records.append(
+                {
+                    "method": method,
+                    "pearson_r": float(y),
+                    "mean_true_fr_hz": pd.to_numeric(row.get("mean_true_fr_hz", np.nan), errors="coerce"),
+                    "var_true_fr_hz2": pd.to_numeric(row.get("var_true_fr_hz2", np.nan), errors="coerce"),
+                    "cv_true_fr": pd.to_numeric(row.get("cv_true_fr", np.nan), errors="coerce"),
+                    "complex_event_ratio": pd.to_numeric(row.get("complex_event_ratio", np.nan), errors="coerce"),
+                    "burst_or_complex_event_ratio": pd.to_numeric(row.get("burst_or_complex_event_ratio", np.nan), errors="coerce"),
+                    "simple_single_event_ratio": pd.to_numeric(row.get("simple_single_event_ratio", np.nan), errors="coerce"),
+                }
+            )
+
+    plot_df = pd.DataFrame(records)
+    if methods_to_include is not None:
+        wanted = {str(method) for method in methods_to_include}
+        plot_df = plot_df[plot_df["method"].astype(str).isin(wanted)].copy()
+    if len(plot_df) == 0:
+        return None
+
+    method_order = [
+        "calcium_trace_nolag",
+        "calcium_trace_lag",
+        "suite2p_unscaled",
+        "suite2p_scaled",
+        "cascade_unscaled",
+        "cascade_scaled",
+    ]
+    display_names = {
+        "calcium_trace_nolag": "raw calcium",
+        "calcium_trace_lag": "calcium lag corrected",
+        "suite2p_unscaled": "suite2p",
+        "suite2p_scaled": "suite2p",
+        "cascade_unscaled": "pre-trained cascade",
+        "cascade_scaled": "pre-trained cascade",
+    }
+    colors = {
+        "mean_FR": "rgba(155, 182, 217, 0.62)",
+        "FR_variance": "rgba(124, 203, 119, 0.62)",
+        "CV_FR": "rgba(102, 194, 165, 0.62)",
+        "complex_total_event_ratio": "rgba(244, 162, 97, 0.62)",
+        "burst_complex_total_event_ratio": "rgba(231, 111, 81, 0.62)",
+        "single_total_event_ratio": "rgba(190, 174, 212, 0.62)",
+    }
+    rows = []
+    for method in [m for m in method_order if m in set(plot_df["method"])]:
+        sub = plot_df[plot_df["method"].astype(str) == method].copy()
+        y = np.arctanh(np.clip(pd.to_numeric(sub["pearson_r"], errors="coerce").to_numpy(float), -0.999999, 0.999999))
+        predictors = {
+            "mean_FR": _standardize_for_partial_r2(pd.to_numeric(sub["mean_true_fr_hz"], errors="coerce").to_numpy(float)),
+            "FR_variance": _standardize_for_partial_r2(pd.to_numeric(sub["var_true_fr_hz2"], errors="coerce").to_numpy(float)),
+            "CV_FR": _standardize_for_partial_r2(pd.to_numeric(sub["cv_true_fr"], errors="coerce").to_numpy(float)),
+            "complex_total_event_ratio": _standardize_for_partial_r2(
+                pd.to_numeric(sub["complex_event_ratio"], errors="coerce").to_numpy(float)
+            ),
+            "burst_complex_total_event_ratio": _standardize_for_partial_r2(
+                pd.to_numeric(sub["burst_or_complex_event_ratio"], errors="coerce").to_numpy(float)
+            ),
+            "single_total_event_ratio": _standardize_for_partial_r2(
+                pd.to_numeric(sub["simple_single_event_ratio"], errors="coerce").to_numpy(float)
+            ),
+        }
+        names = list(predictors.keys())
+        full_r2, n_used = _ols_r2_for_partial_r2(y, np.column_stack([predictors[n] for n in names]))
+        for name in names:
+            red_r2, _ = _ols_r2_for_partial_r2(y, np.column_stack([predictors[n] for n in names if n != name]))
+            delta = full_r2 - red_r2 if np.isfinite(full_r2) and np.isfinite(red_r2) else np.nan
+            rows.append(
+                {
+                    "method": method,
+                    "method_label": display_names.get(method, method),
+                    "predictor": name,
+                    "partial_delta_r2": float(delta) if np.isfinite(delta) else np.nan,
+                    "full_r2": float(full_r2) if np.isfinite(full_r2) else np.nan,
+                    "n_used": int(n_used),
+                }
+            )
+    out = pd.DataFrame(rows)
+    if len(out) == 0:
+        return None
+    csv_path = os.path.splitext(str(save_html))[0] + ".csv"
+    out.to_csv(csv_path, index=False)
+
+    fig = go.Figure()
+    predictor_order = [
+        "mean_FR",
+        "FR_variance",
+        "CV_FR",
+        "complex_total_event_ratio",
+        "burst_complex_total_event_ratio",
+        "single_total_event_ratio",
+    ]
+    if out["method"].astype(str).nunique() == 1:
+        single = out.set_index("predictor").reindex(predictor_order).reset_index()
+        fig.add_trace(
+            go.Bar(
+                x=single["predictor"],
+                y=single["partial_delta_r2"],
+                marker_color=[colors.get(pred, "#777777") for pred in single["predictor"]],
+                showlegend=False,
+                hovertemplate="predictor=%{x}<br>partial ?R?=%{y:.4f}<extra></extra>",
+            )
+        )
+        xaxis_title = "predictor removed from full model"
+        showlegend = False
+    else:
+        for pred in predictor_order:
+            sub = out[out["predictor"] == pred].copy()
+            fig.add_trace(
+                go.Bar(
+                    x=sub["method_label"],
+                    y=sub["partial_delta_r2"],
+                    name=pred,
+                    marker_color=colors.get(pred, "#777777"),
+                    hovertemplate="method=%{x}<br>partial ?R?=%{y:.4f}<extra></extra>",
+                )
+            )
+        xaxis_title = "correlation method"
+        showlegend = True
+    fig.update_layout(
+        template="simple_white",
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        width=1050,
+        height=560,
+        title="",
+        barmode="group",
+        bargap=0,
+        bargroupgap=0,
+        xaxis_title=xaxis_title,
+        yaxis_title="partial ?R? after controlling other predictors",
+        font=dict(size=15),
+        margin=dict(l=90, r=45, t=45, b=120),
+        showlegend=showlegend,
+    )
+    fig.update_xaxes(showgrid=False, zeroline=False, showline=True, linecolor="black", ticks="outside")
+    fig.update_yaxes(showgrid=False, zeroline=False, showline=True, linecolor="black", ticks="outside")
+    os.makedirs(os.path.dirname(save_html), exist_ok=True)
+    fig.write_html(save_html)
+    if save_svg is not None:
+        try:
+            fig.write_image(save_svg)
+        except Exception:
+            pass
     return fig
 
 
@@ -4288,9 +5754,76 @@ def _auc_trapezoid(y, x):
     return float(np.trapz(y, x))
 
 
+def _load_completed_trained_loo_metrics(
+    report_csv,
+    variant="f01_p8",
+    model_label="cascade_trained_f01_p8",
+):
+    """Load one completed leave-one-cell-out test result per held-out cell."""
+    report_path = Path(report_csv)
+    if not report_path.is_file():
+        raise FileNotFoundError(f"Trained CASCADE LOO report not found: {report_path}")
+    report_df = pd.read_csv(report_path)
+    required = {"variant", "model_name", "heldout_core_cell_id", "corr", "relative_error", "relative_bias"}
+    missing = sorted(required.difference(report_df.columns))
+    if missing:
+        raise RuntimeError(f"LOO report is missing required columns {missing}: {report_path}")
+
+    use = report_df[report_df["variant"].astype(str) == str(variant)].copy()
+    if len(use) == 0:
+        raise RuntimeError(f"No rows for variant={variant!r} in trained LOO report: {report_path}")
+
+    # Report location: <transfer_root>/reports_leave_one_cell/<variant>/<file>.csv
+    transfer_root = report_path.parents[2]
+    model_root = transfer_root / "models_leave_one_cell"
+    rows = []
+    skipped = []
+    for _, rec in use.iterrows():
+        model_name = str(rec["model_name"])
+        cfg_path = model_root / str(rec["variant"]) / model_name / "config.yaml"
+        completed = False
+        if cfg_path.is_file():
+            try:
+                completed = "training_finished: yes" in cfg_path.read_text(
+                    encoding="utf-8", errors="replace"
+                ).lower()
+            except Exception:
+                completed = False
+        if not completed:
+            skipped.append(
+                {
+                    "model_name": model_name,
+                    "heldout_core_cell_id": str(rec["heldout_core_cell_id"]),
+                    "reason": f"model_not_completed_or_missing_config:{cfg_path}",
+                }
+            )
+            continue
+        rows.append(
+            {
+                "model": str(model_label),
+                "cell_path": str(rec.get("cell_path", rec["heldout_core_cell_id"])),
+                "cell_name": str(rec["heldout_core_cell_id"]),
+                "state": "loo_heldout",
+                "pkl_path": np.nan,
+                "ok": True,
+                "reason": "",
+                "model_display": f"{model_label}_unscaled",
+                "calibration_mode": "unscaled",
+                "pearson_corr_true_vs_pred": pd.to_numeric(rec["corr"], errors="coerce"),
+                "relative_error": pd.to_numeric(rec["relative_error"], errors="coerce"),
+                "relative_bias": pd.to_numeric(rec["relative_bias"], errors="coerce"),
+                "trained_variant": str(rec["variant"]),
+                "trained_model_name": model_name,
+                "heldout_core_cell_id": str(rec["heldout_core_cell_id"]),
+                "trained_report_source": str(report_path),
+            }
+        )
+    return pd.DataFrame(rows), pd.DataFrame(skipped)
+
+
 def compare_suite2p_and_cascade_bias_metrics(
     loaded_cells,
-    summary_out_dir=r"Z:\Adam-Lab-Shared\Data\Michal_Rubin\data summery\2026\Pyr\model_compare",
+    summary_out_dir=r"Z:\Adam-Lab-Shared\Data\Michal_Rubin\data_summery\2026\Pyr\model_compare",
     per_cell_subdir="model_compare",
     include_suite2p=True,
     include_cascade=True,
@@ -4299,12 +5832,17 @@ def compare_suite2p_and_cascade_bias_metrics(
     cascade_threshold=0,
     cascade_verbosity=0,
     cascade_convert_to_hz=True,
+    additional_cascade_models=None,
+    trained_loo_report_csv=None,
+    trained_loo_variant="f01_p8",
+    trained_loo_label="cascade_trained_f01_p8",
     smooth_sigma_s=0.05,
     max_lag_s=0.5,
     scale_pred_to_true=True,
     scale_pred_to_true_suite2p=None,
     scale_pred_to_true_cascade=None,
     use_lag_correction=True,
+    lag_correction_mode="optimal",
     report_scaled_and_unscaled=False,
     use_cal_mask=True,
     peri_window_s=(-1.0, 1.0),
@@ -4335,43 +5873,104 @@ def compare_suite2p_and_cascade_bias_metrics(
       - `report_scaled_and_unscaled=True` reports both variants for each model/state
         in one run (adds `calibration_mode` and `model_display` columns).
 
+    Additional trained models:
+      - `additional_cascade_models` may be a list of dictionaries with `label`,
+        `model_name`, and `model_folder` keys. Each is predicted and plotted as a
+        separate model alongside Suite2p and the optional pretrained CASCADE model.
+      - `trained_loo_report_csv` loads the completed held-out test metrics from
+        cascade training: one result per cell from the model that excluded it.
+
     Returns a DataFrame with one row per model/cell/state and saves:
       - per-cell complex-event temporal-bias HTML/SVG plots;
       - summary CSV;
       - summary violin + beeswarm figure in `summary_out_dir/model_compare`.
     """
+    lag_correction_mode = str(lag_correction_mode or "optimal").strip().lower()
+    if lag_correction_mode not in {"optimal", "median"}:
+        raise ValueError("lag_correction_mode must be 'optimal' or 'median'")
     model_sets = []
+    cascade_prediction_errors = []
     if bool(include_suite2p):
         model_sets.append(("suite2p", loaded_cells, []))
+
+    cascade_specs = []
     if bool(include_cascade):
+        cascade_specs.append(
+            {
+                "label": "cascade",
+                "model_name": cascade_model_name,
+                "model_folder": cascade_model_folder,
+                "threshold": cascade_threshold,
+                "verbosity": cascade_verbosity,
+                "convert_to_hz": cascade_convert_to_hz,
+            }
+        )
+    for spec in ([] if additional_cascade_models is None else list(additional_cascade_models)):
+        if not isinstance(spec, dict):
+            raise TypeError("Each additional_cascade_models entry must be a dictionary.")
+        label = str(spec.get("label", "")).strip()
+        model_name = str(spec.get("model_name", "")).strip()
+        if not label or not model_name:
+            raise ValueError("Each additional CASCADE model needs non-empty 'label' and 'model_name'.")
+        if label in {"suite2p", "cascade"}:
+            raise ValueError(f"Additional CASCADE label is reserved: {label!r}")
+        cascade_specs.append(
+            {
+                "label": label,
+                "model_name": model_name,
+                "model_folder": spec.get("model_folder", cascade_model_folder),
+                "threshold": spec.get("threshold", cascade_threshold),
+                "verbosity": spec.get("verbosity", cascade_verbosity),
+                "convert_to_hz": spec.get("convert_to_hz", cascade_convert_to_hz),
+            }
+        )
+
+    seen_cascade_labels = set()
+    for spec in cascade_specs:
+        label = str(spec["label"])
+        if label in seen_cascade_labels:
+            raise ValueError(f"Duplicate CASCADE model label: {label!r}")
+        seen_cascade_labels.add(label)
         cascade_cells, cascade_errors, n_cascade_ok = _attach_cascade_predictions_to_loaded_cells(
             loaded_cells=loaded_cells,
-            cascade_model_name=cascade_model_name,
-            cascade_model_folder=cascade_model_folder,
-            cascade_threshold=cascade_threshold,
-            cascade_verbosity=cascade_verbosity,
-            cascade_convert_to_hz=cascade_convert_to_hz,
+            cascade_model_name=spec["model_name"],
+            cascade_model_folder=spec["model_folder"],
+            cascade_threshold=spec["threshold"],
+            cascade_verbosity=spec["verbosity"],
+            cascade_convert_to_hz=spec["convert_to_hz"],
         )
+        for error in cascade_errors:
+            cascade_prediction_errors.append({"model": label, **error})
         if n_cascade_ok <= 0 and len(cascade_errors) > 0:
             first_err = cascade_errors[0]
-            if bool(include_suite2p):
+            if bool(include_suite2p) or len(model_sets) > 0:
                 print(
-                    "[WARN] CASCADE prediction unavailable for this run; "
-                    "continuing with suite2p only. "
+                    f"[WARN] CASCADE prediction unavailable for model={label!r}; "
+                    "continuing with available models. "
                     f"First failure: cell={first_err.get('cell_path','')}, "
                     f"state={first_err.get('state','')}, error={first_err.get('error','')}"
                 )
             else:
                 raise RuntimeError(
-                    "CASCADE prediction failed for all states. "
+                    f"CASCADE prediction failed for all states for model={label!r}. "
                     f"First failure: cell={first_err.get('cell_path','')}, state={first_err.get('state','')}, "
                     f"error={first_err.get('error','')}"
                 )
         else:
-            model_sets.append(("cascade", cascade_cells, cascade_errors))
+            model_sets.append((label, cascade_cells, cascade_errors))
 
     summary_dir = os.path.join(str(summary_out_dir), "model_compare")
     os.makedirs(summary_dir, exist_ok=True)
+    cascade_error_csv = os.path.join(summary_dir, "bias_metrics_model_compare_cascade_prediction_errors.csv")
+    pd.DataFrame(
+        cascade_prediction_errors,
+        columns=["model", "cell_path", "state", "error"],
+    ).to_csv(cascade_error_csv, index=False)
+    if cascade_prediction_errors:
+        print(
+            f"[WARN] Saved {len(cascade_prediction_errors)} CASCADE prediction errors: "
+            f"{cascade_error_csv}"
+        )
     rows = []
     pre_s, post_s = float(peri_window_s[0]), float(peri_window_s[1])
     if pre_s > 0:
@@ -4379,10 +5978,42 @@ def compare_suite2p_and_cascade_bias_metrics(
     if post_s <= 0:
         post_s = abs(post_s)
 
+    fixed_prediction_lag_by_model = {}
+    fixed_calcium_lag_s = None
+    if bool(use_lag_correction) and lag_correction_mode == "median":
+        calcium_lags = []
+        for model_name, cells_for_model, _model_errors in model_sets:
+            model_lags = []
+            for cell in cells_for_model:
+                if not bool(cell.get("loaded", False)):
+                    continue
+                for st in cell.get("states", []):
+                    series, _reason = _build_state_true_pred_for_compare(
+                        cell=cell,
+                        st=st,
+                        smooth_sigma_s=smooth_sigma_s,
+                        max_lag_s=max_lag_s,
+                        scale_pred_to_true=False,
+                        use_lag_correction=False,
+                        use_cal_mask=use_cal_mask,
+                    )
+                    if series is None:
+                        continue
+                    model_lag = float(series.get("optimal_lag_s", np.nan))
+                    calcium_lag = float(series.get("cal_optimal_lag_s", np.nan))
+                    if np.isfinite(model_lag):
+                        model_lags.append(model_lag)
+                    if np.isfinite(calcium_lag):
+                        calcium_lags.append(calcium_lag)
+            fixed_prediction_lag_by_model[str(model_name)] = (
+                float(np.nanmedian(model_lags)) if len(model_lags) else np.nan
+            )
+        fixed_calcium_lag_s = float(np.nanmedian(calcium_lags)) if len(calcium_lags) else np.nan
+
     for model_name, cells_for_model, model_errors in model_sets:
         if str(model_name).lower() == "suite2p":
             model_scale_flag = bool(scale_pred_to_true) if scale_pred_to_true_suite2p is None else bool(scale_pred_to_true_suite2p)
-        elif str(model_name).lower() == "cascade":
+        elif str(model_name).lower() == "cascade" or str(model_name).lower().startswith("cascade_"):
             model_scale_flag = bool(scale_pred_to_true) if scale_pred_to_true_cascade is None else bool(scale_pred_to_true_cascade)
         else:
             model_scale_flag = bool(scale_pred_to_true)
@@ -4400,6 +6031,10 @@ def compare_suite2p_and_cascade_bias_metrics(
                     max_lag_s=max_lag_s,
                     scale_pred_to_true=(False if bool(report_scaled_and_unscaled) else model_scale_flag),
                     use_lag_correction=use_lag_correction,
+                    fixed_prediction_lag_s=fixed_prediction_lag_by_model.get(str(model_name), np.nan)
+                    if lag_correction_mode == "median"
+                    else None,
+                    fixed_calcium_lag_s=fixed_calcium_lag_s if lag_correction_mode == "median" else None,
                     use_cal_mask=use_cal_mask,
                 )
                 base_row = {
@@ -4416,23 +6051,48 @@ def compare_suite2p_and_cascade_bias_metrics(
                     continue
                 true_fr = np.asarray(series["true_fr"], dtype=float)
                 pred_unscaled = np.asarray(series["pred_eval"], dtype=float)
+                pred_nolag_unscaled = np.asarray(series.get("pred_smooth", []), dtype=float)
+                true_fr_valid = true_fr[np.isfinite(true_fr)]
+                if true_fr_valid.size > 0:
+                    mean_true_fr = float(np.nanmean(true_fr_valid))
+                    std_true_fr = float(np.nanstd(true_fr_valid))
+                    var_true_fr = float(np.nanvar(true_fr_valid))
+                    cv_true_fr = float(std_true_fr / mean_true_fr) if abs(mean_true_fr) > 1e-12 else np.nan
+                    fano_true_fr = float(var_true_fr / mean_true_fr) if abs(mean_true_fr) > 1e-12 else np.nan
+                else:
+                    mean_true_fr = np.nan
+                    std_true_fr = np.nan
+                    var_true_fr = np.nan
+                    cv_true_fr = np.nan
+                    fano_true_fr = np.nan
                 scale_fit, offset_fit, pred_scaled = _linear_fit_scale_offset(pred_unscaled, true_fr)
+                scale_fit_nolag, offset_fit_nolag, pred_scaled_nolag = _linear_fit_scale_offset(pred_nolag_unscaled, true_fr)
                 if bool(report_scaled_and_unscaled):
                     mode_defs = [
-                        ("unscaled", pred_unscaled, 1.0, 0.0),
-                        ("scaled", pred_scaled, scale_fit, offset_fit),
+                        ("unscaled", pred_unscaled, 1.0, 0.0, pred_nolag_unscaled),
+                        ("scaled", pred_scaled, scale_fit, offset_fit, pred_scaled_nolag),
                     ]
                 else:
                     mode_name = "scaled" if bool(model_scale_flag) else "unscaled"
                     if bool(model_scale_flag):
-                        mode_defs = [(mode_name, pred_scaled, scale_fit, offset_fit)]
+                        mode_defs = [(mode_name, pred_scaled, scale_fit, offset_fit, pred_scaled_nolag)]
                     else:
-                        mode_defs = [(mode_name, pred_unscaled, 1.0, 0.0)]
+                        mode_defs = [(mode_name, pred_unscaled, 1.0, 0.0, pred_nolag_unscaled)]
 
                 ev_list = _complex_like_events_from_state_pkl(
                     st.get("spike_pkl_data", {}),
                     vol_len=int(series["vol_len"]),
                     vol_sr=float(series["vol_sr"]),
+                )
+                event_summary = _event_count_summary_from_state_pkl(
+                    st.get("spike_pkl_data", {}),
+                    vol_len=int(series["vol_len"]),
+                    vol_sr=float(series["vol_sr"]),
+                )
+                valid_duration_s = (
+                    float(true_fr_valid.size) / float(series["cal_sr"])
+                    if true_fr_valid.size > 0 and float(series["cal_sr"]) > 0
+                    else np.nan
                 )
                 pre_n = int(round(abs(pre_s) * float(series["cal_sr"])))
                 post_n = int(round(abs(post_s) * float(series["cal_sr"])))
@@ -4440,7 +6100,7 @@ def compare_suite2p_and_cascade_bias_metrics(
                 rel_t = offsets.astype(float) / float(series["cal_sr"])
                 n_events_total = int(len(ev_list))
 
-                for mode_name, pred_mode, scale_mode, offset_mode in mode_defs:
+                for mode_name, pred_mode, scale_mode, offset_mode, pred_mode_nolag in mode_defs:
                     rel_error, rel_bias, fp, fn, true_spikes = _relative_error_bias_from_rates(
                         true_fr=series["true_fr"],
                         pred_fr=pred_mode,
@@ -4448,6 +6108,7 @@ def compare_suite2p_and_cascade_bias_metrics(
                         cal_sr=float(series["cal_sr"]),
                     )
                     pearson_corr = _pearson_corr_valid(series["true_fr"], pred_mode)
+                    pearson_corr_nolag = _pearson_corr_valid(series["true_fr"], pred_mode_nolag)
 
                     cal_stack = []
                     true_stack = []
@@ -4530,6 +6191,9 @@ def compare_suite2p_and_cascade_bias_metrics(
                             "model_display": f"{model_name}_{mode_name}",
                             "calibration_mode": str(mode_name),
                             "pearson_corr_true_vs_pred": float(pearson_corr) if np.isfinite(pearson_corr) else np.nan,
+                            "pearson_corr_true_vs_pred_nolag": float(pearson_corr_nolag)
+                            if np.isfinite(pearson_corr_nolag)
+                            else np.nan,
                             "pearson_corr_calcium_vs_true_fr": float(series.get("corr_calcium_vs_true_fr", np.nan))
                             if np.isfinite(series.get("corr_calcium_vs_true_fr", np.nan))
                             else np.nan,
@@ -4538,6 +6202,9 @@ def compare_suite2p_and_cascade_bias_metrics(
                             else np.nan,
                             "calcium_best_lag_s": float(series.get("cal_best_lag_s", np.nan))
                             if np.isfinite(series.get("cal_best_lag_s", np.nan))
+                            else np.nan,
+                            "calcium_optimal_lag_s": float(series.get("cal_optimal_lag_s", np.nan))
+                            if np.isfinite(series.get("cal_optimal_lag_s", np.nan))
                             else np.nan,
                             "calcium_best_lag_corr": float(series.get("cal_best_lag_corr", np.nan))
                             if np.isfinite(series.get("cal_best_lag_corr", np.nan))
@@ -4548,6 +6215,41 @@ def compare_suite2p_and_cascade_bias_metrics(
                             "false_positive_mass": fp,
                             "false_negative_mass": fn,
                             "true_spike_count": true_spikes,
+                            "mean_true_fr_hz": mean_true_fr,
+                            "std_true_fr_hz": std_true_fr,
+                            "var_true_fr_hz2": var_true_fr,
+                            "cv_true_fr": cv_true_fr,
+                            "fano_true_fr": fano_true_fr,
+                            "n_true_fr_valid_bins": int(true_fr_valid.size),
+                            "n_events_total": int(event_summary.get("n_events_total", 0)),
+                            "n_complex_events_total": int(event_summary.get("n_complex_events_total", 0)),
+                            "complex_event_rate_hz": (
+                                float(event_summary.get("n_complex_events_total", 0)) / float(valid_duration_s)
+                                if np.isfinite(valid_duration_s) and float(valid_duration_s) > 0
+                                else np.nan
+                            ),
+                            "complex_event_ratio": float(event_summary.get("complex_event_ratio", np.nan))
+                            if np.isfinite(event_summary.get("complex_event_ratio", np.nan))
+                            else np.nan,
+                            "n_simple_burst_events_total": int(event_summary.get("n_simple_burst_events_total", 0)),
+                            "simple_burst_event_rate_hz": (
+                                float(event_summary.get("n_simple_burst_events_total", 0)) / float(valid_duration_s)
+                                if np.isfinite(valid_duration_s) and float(valid_duration_s) > 0
+                                else np.nan
+                            ),
+                            "n_burst_or_complex_events_total": int(event_summary.get("n_burst_or_complex_events_total", 0)),
+                            "burst_or_complex_event_ratio": float(event_summary.get("burst_or_complex_event_ratio", np.nan))
+                            if np.isfinite(event_summary.get("burst_or_complex_event_ratio", np.nan))
+                            else np.nan,
+                            "n_simple_single_events_total": int(event_summary.get("n_simple_single_events_total", 0)),
+                            "simple_single_event_rate_hz": (
+                                float(event_summary.get("n_simple_single_events_total", 0)) / float(valid_duration_s)
+                                if np.isfinite(valid_duration_s) and float(valid_duration_s) > 0
+                                else np.nan
+                            ),
+                            "simple_single_event_ratio": float(event_summary.get("simple_single_event_ratio", np.nan))
+                            if np.isfinite(event_summary.get("simple_single_event_ratio", np.nan))
+                            else np.nan,
                             "temporal_bias_index": temporal_bias_index,
                             "temporal_bias_index_raw_formula": temporal_bias_index_raw_formula,
                             "auc_pre_error": auc_pre,
@@ -4557,7 +6259,21 @@ def compare_suite2p_and_cascade_bias_metrics(
                             "align_to": str(align_to),
                             "smooth_sigma_s": float(smooth_sigma_s),
                             "max_lag_s": float(max_lag_s),
+                            "lag_correction_mode": str(lag_correction_mode),
+                            "use_lag_correction": bool(use_lag_correction),
+                            "fixed_model_lag_s": float(fixed_prediction_lag_by_model.get(str(model_name), np.nan))
+                            if lag_correction_mode == "median"
+                            and np.isfinite(fixed_prediction_lag_by_model.get(str(model_name), np.nan))
+                            else np.nan,
+                            "fixed_calcium_lag_s": float(fixed_calcium_lag_s)
+                            if lag_correction_mode == "median"
+                            and fixed_calcium_lag_s is not None
+                            and np.isfinite(fixed_calcium_lag_s)
+                            else np.nan,
                             "lag_s": float(series["lag_s"]),
+                            "optimal_lag_s": float(series.get("optimal_lag_s", np.nan))
+                            if np.isfinite(series.get("optimal_lag_s", np.nan))
+                            else np.nan,
                             "best_lag_corr": float(series["corr_best_lag"]) if np.isfinite(series["corr_best_lag"]) else np.nan,
                             "scale_pred_to_true": bool(mode_name == "scaled"),
                             "scale_pred_to_true_suite2p": bool(scale_pred_to_true_suite2p) if scale_pred_to_true_suite2p is not None else np.nan,
@@ -4570,15 +6286,112 @@ def compare_suite2p_and_cascade_bias_metrics(
                     )
                     rows.append(row)
 
+    trained_loo_skipped_df = pd.DataFrame()
+    if trained_loo_report_csv is not None:
+        trained_loo_df, trained_loo_skipped_df = _load_completed_trained_loo_metrics(
+            trained_loo_report_csv,
+            variant=trained_loo_variant,
+            model_label=trained_loo_label,
+        )
+        if len(trained_loo_df) > 0:
+            rows.extend(trained_loo_df.to_dict("records"))
+            print(
+                f"[OK] Added {len(trained_loo_df)} completed held-out rows for "
+                f"{trained_loo_label!r} ({trained_loo_variant})."
+            )
+        if len(trained_loo_skipped_df) > 0:
+            print(f"[WARN] Skipped {len(trained_loo_skipped_df)} unfinished/missing trained LOO models.")
+
     metrics_df = pd.DataFrame(rows)
     csv_path = os.path.join(summary_dir, "bias_metrics_model_compare.csv")
     metrics_df.to_csv(csv_path, index=False)
+    trained_loo_csv = os.path.join(summary_dir, "bias_metrics_model_compare_trained_loo_rows.csv")
+    trained_loo_skipped_csv = os.path.join(summary_dir, "bias_metrics_model_compare_trained_loo_skipped.csv")
+    if trained_loo_report_csv is not None:
+        metrics_df.loc[
+            metrics_df.get("model", pd.Series(dtype=str)).astype(str) == str(trained_loo_label)
+        ].to_csv(trained_loo_csv, index=False)
+        trained_loo_skipped_df.to_csv(trained_loo_skipped_csv, index=False)
     if "ok" in metrics_df.columns:
         ok_df = metrics_df[metrics_df["ok"] == True].copy()
     else:
         ok_df = metrics_df.copy()
+    corr_lag_simple_csv = os.path.join(
+        summary_dir,
+        "bias_metrics_model_compare_correlation_lag_summary_simple.csv",
+    )
+    simple_rows = []
+    if len(ok_df) > 0:
+        if {"cell_path", "state"}.issubset(ok_df.columns):
+            cal_df = (
+                ok_df.sort_values(["cell_path", "state"])
+                .groupby(["cell_path", "state"], as_index=False, dropna=False)
+                .first()
+            )
+        else:
+            cal_df = ok_df.copy()
+        for _, rr in cal_df.iterrows():
+            lag_mode = str(rr.get("lag_correction_mode", "")).strip().lower()
+            lag_corr = pd.to_numeric(rr.get("pearson_corr_calcium_vs_true_fr", np.nan), errors="coerce")
+            simple_rows.append(
+                {
+                    "cell_path": str(rr.get("cell_path", "")),
+                    "state": str(rr.get("state", "")),
+                    "method": "calcium_trace",
+                    "calibration_mode": "",
+                    "mean_fr_hz": pd.to_numeric(rr.get("mean_true_fr_hz", np.nan), errors="coerce"),
+                    "fr_std_hz": pd.to_numeric(rr.get("std_true_fr_hz", np.nan), errors="coerce"),
+                    "cv_fr": pd.to_numeric(rr.get("cv_true_fr", np.nan), errors="coerce"),
+                    "basic_correlation_no_lag": pd.to_numeric(
+                        rr.get("pearson_corr_calcium_vs_true_fr_nolag", np.nan), errors="coerce"
+                    ),
+                    "lag_corrected_correlation": lag_corr,
+                    "median_lag_corrected_correlation": lag_corr if lag_mode == "median" else np.nan,
+                    "applied_lag_s": pd.to_numeric(rr.get("calcium_best_lag_s", np.nan), errors="coerce"),
+                    "fixed_median_lag_s": pd.to_numeric(rr.get("fixed_calcium_lag_s", np.nan), errors="coerce"),
+                    "best_lag_s": pd.to_numeric(rr.get("calcium_optimal_lag_s", np.nan), errors="coerce"),
+                    "lag_correction_mode": lag_mode,
+                }
+            )
+    pd.DataFrame(simple_rows).to_csv(corr_lag_simple_csv, index=False)
     fig_html = os.path.join(summary_dir, "bias_metrics_model_compare.html")
     fig_svg = os.path.join(summary_dir, "bias_metrics_model_compare.svg") if bool(save_svg) else None
+    corr_fr_stats_html = os.path.join(summary_dir, "bias_metrics_model_compare_corr_vs_fr_stats.html")
+    corr_fr_stats_svg = (
+        os.path.join(summary_dir, "bias_metrics_model_compare_corr_vs_fr_stats.svg")
+        if bool(save_svg)
+        else None
+    )
+    corr_fr_stats_calcium_lag_html = os.path.join(
+        summary_dir,
+        "bias_metrics_model_compare_corr_vs_fr_stats_calcium_lag_only.html",
+    )
+    corr_fr_stats_calcium_lag_svg = (
+        os.path.join(summary_dir, "bias_metrics_model_compare_corr_vs_fr_stats_calcium_lag_only.svg")
+        if bool(save_svg)
+        else None
+    )
+    lag_hist_html = os.path.join(summary_dir, "bias_metrics_model_compare_chosen_lag_histogram.html")
+    lag_hist_svg = (
+        os.path.join(summary_dir, "bias_metrics_model_compare_chosen_lag_histogram.svg")
+        if bool(save_svg)
+        else None
+    )
+    fr_driver_partial_html = os.path.join(summary_dir, "bias_metrics_model_compare_fr_driver_partial_r2.html")
+    fr_driver_partial_svg = (
+        os.path.join(summary_dir, "bias_metrics_model_compare_fr_driver_partial_r2.svg")
+        if bool(save_svg)
+        else None
+    )
+    fr_driver_partial_calcium_lag_html = os.path.join(
+        summary_dir,
+        "bias_metrics_model_compare_fr_driver_partial_r2_calcium_lag_only.html",
+    )
+    fr_driver_partial_calcium_lag_svg = (
+        os.path.join(summary_dir, "bias_metrics_model_compare_fr_driver_partial_r2_calcium_lag_only.svg")
+        if bool(save_svg)
+        else None
+    )
     if len(ok_df) > 0:
         _plot_model_compare_bias_metrics(
             ok_df,
@@ -4590,10 +6403,363 @@ def compare_suite2p_and_cascade_bias_metrics(
                 + ("scaled+unscaled" if bool(report_scaled_and_unscaled) else f"scaled={bool(scale_pred_to_true)}")
             ),
         )
+        _plot_model_compare_corr_vs_fr_stats(
+            ok_df,
+            save_html=corr_fr_stats_html,
+            save_svg=corr_fr_stats_svg,
+            title=(
+                f"Model compare correlation vs FR statistics | align={align_to} | "
+                f"smooth={float(smooth_sigma_s):.3g}s"
+            ),
+        )
+        _plot_model_compare_corr_vs_fr_stats(
+            ok_df,
+            save_html=corr_fr_stats_calcium_lag_html,
+            save_svg=corr_fr_stats_calcium_lag_svg,
+            title=(
+                f"Calcium lag-corrected correlation vs FR statistics | align={align_to} | "
+                f"smooth={float(smooth_sigma_s):.3g}s"
+            ),
+            methods_to_include=["calcium_trace_lag"],
+        )
+        _plot_model_compare_lag_histograms(
+            ok_df,
+            save_html=lag_hist_html,
+            save_svg=lag_hist_svg,
+            title=f"Model compare chosen lag per cell | align={align_to} | max lag={float(max_lag_s):.3g}s",
+        )
+        _plot_model_compare_fr_driver_partial_r2(
+            ok_df,
+            save_html=fr_driver_partial_html,
+            save_svg=fr_driver_partial_svg,
+            title=(
+                "Partial R? for correlation explained by FR and event metrics "
+                f"| align={align_to}"
+            ),
+        )
+        _plot_model_compare_fr_driver_partial_r2(
+            ok_df,
+            save_html=fr_driver_partial_calcium_lag_html,
+            save_svg=fr_driver_partial_calcium_lag_svg,
+            title=(
+                "Calcium lag-corrected partial R? for correlation explained by FR and event metrics "
+                f"| align={align_to}"
+            ),
+            methods_to_include=["calcium_trace_lag"],
+        )
     metrics_df.attrs["summary_csv"] = csv_path
+    metrics_df.attrs["correlation_lag_summary_simple_csv"] = corr_lag_simple_csv
     metrics_df.attrs["summary_html"] = fig_html if len(ok_df) > 0 else None
     metrics_df.attrs["summary_svg"] = fig_svg if len(ok_df) > 0 and bool(save_svg) else None
+    metrics_df.attrs["corr_vs_fr_stats_html"] = corr_fr_stats_html if len(ok_df) > 0 else None
+    metrics_df.attrs["corr_vs_fr_stats_svg"] = corr_fr_stats_svg if len(ok_df) > 0 and bool(save_svg) else None
+    metrics_df.attrs["corr_vs_fr_stats_calcium_lag_only_html"] = (
+        corr_fr_stats_calcium_lag_html if len(ok_df) > 0 else None
+    )
+    metrics_df.attrs["corr_vs_fr_stats_calcium_lag_only_svg"] = (
+        corr_fr_stats_calcium_lag_svg if len(ok_df) > 0 and bool(save_svg) else None
+    )
+    metrics_df.attrs["chosen_lag_histogram_html"] = lag_hist_html if len(ok_df) > 0 else None
+    metrics_df.attrs["chosen_lag_histogram_svg"] = lag_hist_svg if len(ok_df) > 0 and bool(save_svg) else None
+    metrics_df.attrs["fr_driver_partial_r2_html"] = fr_driver_partial_html if len(ok_df) > 0 else None
+    metrics_df.attrs["fr_driver_partial_r2_svg"] = (
+        fr_driver_partial_svg if len(ok_df) > 0 and bool(save_svg) else None
+    )
+    metrics_df.attrs["fr_driver_partial_r2_calcium_lag_only_html"] = (
+        fr_driver_partial_calcium_lag_html if len(ok_df) > 0 else None
+    )
+    metrics_df.attrs["fr_driver_partial_r2_calcium_lag_only_svg"] = (
+        fr_driver_partial_calcium_lag_svg if len(ok_df) > 0 and bool(save_svg) else None
+    )
+    metrics_df.attrs["cascade_prediction_errors_csv"] = cascade_error_csv
+    metrics_df.attrs["trained_loo_rows_csv"] = trained_loo_csv if trained_loo_report_csv is not None else None
+    metrics_df.attrs["trained_loo_skipped_csv"] = trained_loo_skipped_csv if trained_loo_report_csv is not None else None
     return metrics_df
+
+
+def compare_sst_suite2p_cascade_and_calcium(
+    loaded_cells,
+    summary_out_dir=r"Z:\Adam-Lab-Shared\Data\Michal_Rubin\data_summery\2026\SST",
+    per_cell_subdir="sst_model_compare",
+    cascade_model_name="Interneurons_GC8+_30Hz_smoothing50ms_high_noise",
+    cascade_model_folder=None,
+    cascade_threshold=0,
+    cascade_verbosity=0,
+    cascade_convert_to_hz=True,
+    smooth_sigma_s=0.05,
+    calcium_smooth_sigma_s=0.0,
+    max_lag_s=0.5,
+    calcium_fixed_lag_s=None,
+    use_cal_mask=True,
+    save_svg=True,
+):
+    """Compare SST Suite2p, interneuron CASCADE, and calcium-voltage correlations.
+
+    Calcium is reported in two explicitly paired forms: basic zero-lag correlation
+    and correlation after one population-fixed lag. If ``calcium_fixed_lag_s`` is
+    None, the fixed lag is the median of each valid cell/state's best calcium lag.
+    """
+    base_metrics = compare_suite2p_and_cascade_bias_metrics(
+        loaded_cells=loaded_cells,
+        summary_out_dir=summary_out_dir,
+        per_cell_subdir=per_cell_subdir,
+        include_suite2p=True,
+        include_cascade=True,
+        cascade_model_name=cascade_model_name,
+        cascade_model_folder=cascade_model_folder,
+        cascade_threshold=cascade_threshold,
+        cascade_verbosity=cascade_verbosity,
+        cascade_convert_to_hz=cascade_convert_to_hz,
+        smooth_sigma_s=smooth_sigma_s,
+        max_lag_s=max_lag_s,
+        scale_pred_to_true=False,
+        scale_pred_to_true_suite2p=False,
+        scale_pred_to_true_cascade=False,
+        use_lag_correction=True,
+        report_scaled_and_unscaled=False,
+        use_cal_mask=use_cal_mask,
+        save_svg=save_svg,
+    )
+
+    calcium_records = []
+    for cell in loaded_cells:
+        if not bool(cell.get("loaded", False)):
+            continue
+        cell_path = str(cell.get("cell_path", ""))
+        for state_record in cell.get("states", []):
+            state = str(state_record.get("state", "main"))
+            series, reason = _build_state_true_pred_for_compare(
+                cell=cell,
+                st=state_record,
+                smooth_sigma_s=calcium_smooth_sigma_s,
+                max_lag_s=max_lag_s,
+                scale_pred_to_true=False,
+                use_lag_correction=False,
+                use_cal_mask=use_cal_mask,
+            )
+            if series is None:
+                calcium_records.append(
+                    {
+                        "cell_path": cell_path,
+                        "state": state,
+                        "ok": False,
+                        "reason": str(reason),
+                    }
+                )
+                continue
+            calcium_records.append(
+                {
+                    "cell_path": cell_path,
+                    "state": state,
+                    "ok": True,
+                    "reason": "",
+                    "cal_sr_hz": float(series["cal_sr"]),
+                    "calcium_best_lag_s": float(series["cal_best_lag_s"]),
+                    "calcium_best_lag_corr": float(series["cal_best_lag_corr"]),
+                    "calcium_basic_zero_lag_corr": float(series["corr_calcium_vs_true_fr_nolag"]),
+                    "_series": series,
+                }
+            )
+
+    valid_calcium_records = [record for record in calcium_records if bool(record.get("ok", False))]
+    best_lag_values = np.asarray(
+        [record.get("calcium_best_lag_s", np.nan) for record in valid_calcium_records],
+        dtype=float,
+    )
+    best_lag_values = best_lag_values[np.isfinite(best_lag_values)]
+    if calcium_fixed_lag_s is None:
+        fixed_lag_s = float(np.nanmedian(best_lag_values)) if best_lag_values.size else np.nan
+        fixed_lag_source = "median_individual_best_calcium_lags"
+    else:
+        fixed_lag_s = float(calcium_fixed_lag_s)
+        fixed_lag_source = "user_supplied"
+    if not np.isfinite(fixed_lag_s):
+        raise RuntimeError("Could not determine a fixed calcium lag from valid SST cell/state records.")
+
+    calcium_lag_selection_rows = []
+    calcium_value_rows = []
+    for record in calcium_records:
+        row = {key: value for key, value in record.items() if key != "_series"}
+        row["calcium_fixed_lag_s"] = fixed_lag_s
+        row["calcium_fixed_lag_source"] = fixed_lag_source
+        if bool(record.get("ok", False)):
+            series = record["_series"]
+            lag_frames = int(round(fixed_lag_s * float(series["cal_sr"])))
+            calcium_fixed_lag_trace = _lag_correct_prediction_after_true(series["cal_smooth"], lag_frames)
+            fixed_lag_corr = _pearson_corr_valid(calcium_fixed_lag_trace, series["true_fr"])
+            row["calcium_fixed_lag_frames"] = lag_frames
+            row["calcium_fixed_lag_corr"] = float(fixed_lag_corr) if np.isfinite(fixed_lag_corr) else np.nan
+            calcium_value_rows.extend(
+                [
+                    {
+                        "cell_path": record["cell_path"],
+                        "state": record["state"],
+                        "method": "calcium_basic_zero_lag",
+                        "pearson_r": record["calcium_basic_zero_lag_corr"],
+                    },
+                    {
+                        "cell_path": record["cell_path"],
+                        "state": record["state"],
+                        "method": "calcium_fixed_lag",
+                        "pearson_r": row["calcium_fixed_lag_corr"],
+                    },
+                ]
+            )
+        calcium_lag_selection_rows.append(row)
+
+    summary_dir = os.path.join(str(summary_out_dir), "model_compare")
+    os.makedirs(summary_dir, exist_ok=True)
+    calcium_lag_selection_df = pd.DataFrame(calcium_lag_selection_rows)
+    calcium_lag_selection_df = calcium_lag_selection_df.drop(columns=["_series"], errors="ignore")
+    calcium_lag_selection_csv = os.path.join(summary_dir, "sst_calcium_fixed_lag_selection.csv")
+    calcium_lag_selection_df.to_csv(calcium_lag_selection_csv, index=False)
+
+    fixed_lag_csv = os.path.join(summary_dir, "sst_calcium_fixed_lag_summary.csv")
+    pd.DataFrame(
+        [
+            {
+                "fixed_lag_s": fixed_lag_s,
+                "fixed_lag_ms": 1000.0 * fixed_lag_s,
+                "source": fixed_lag_source,
+                "n_valid_cell_states": int(len(valid_calcium_records)),
+                "calcium_smooth_sigma_s": float(calcium_smooth_sigma_s),
+                "max_lag_s_for_selection": float(max_lag_s),
+            }
+        ]
+    ).to_csv(fixed_lag_csv, index=False)
+
+    model_value_rows = []
+    if len(base_metrics) > 0:
+        valid_models = base_metrics.loc[base_metrics.get("ok", pd.Series(False, index=base_metrics.index)) == True].copy()
+        if "calibration_mode" in valid_models.columns:
+            valid_models = valid_models[valid_models["calibration_mode"].astype(str).str.lower() == "unscaled"].copy()
+        label_map = {
+            "suite2p": "suite2p_lag_corrected",
+            "cascade": "cascade_interneuron_lag_corrected",
+        }
+        for model_name, method_name in label_map.items():
+            sub = valid_models[valid_models.get("model", pd.Series("", index=valid_models.index)).astype(str) == model_name]
+            for _, record in sub.iterrows():
+                model_value_rows.append(
+                    {
+                        "cell_path": str(record.get("cell_path", "")),
+                        "state": str(record.get("state", "main")),
+                        "method": method_name,
+                        "pearson_r": pd.to_numeric(record.get("pearson_corr_true_vs_pred", np.nan), errors="coerce"),
+                    }
+                )
+
+    correlation_values_df = pd.concat(
+        [pd.DataFrame(calcium_value_rows), pd.DataFrame(model_value_rows)],
+        axis=0,
+        ignore_index=True,
+    )
+    correlation_values_df["pearson_r"] = pd.to_numeric(correlation_values_df["pearson_r"], errors="coerce")
+    correlation_values_df = correlation_values_df[np.isfinite(correlation_values_df["pearson_r"])].copy()
+    method_order = [
+        "calcium_basic_zero_lag",
+        "calcium_fixed_lag",
+        "suite2p_lag_corrected",
+        "cascade_interneuron_lag_corrected",
+    ]
+    correlation_values_df["method"] = pd.Categorical(
+        correlation_values_df["method"], categories=method_order, ordered=True
+    )
+    correlation_values_df = correlation_values_df.sort_values(["cell_path", "state", "method"])
+    correlation_values_csv = os.path.join(summary_dir, "sst_model_compare_correlation_values.csv")
+    correlation_values_df.to_csv(correlation_values_csv, index=False)
+
+    matched_wide_df = correlation_values_df.pivot_table(
+        index=["cell_path", "state"],
+        columns="method",
+        values="pearson_r",
+        aggfunc="first",
+        observed=False,
+    ).reindex(columns=method_order)
+    matched_wide_df = matched_wide_df.dropna(how="any").reset_index()
+    matched_wide_csv = os.path.join(summary_dir, "sst_model_compare_matched_correlation_values.csv")
+    matched_wide_df.to_csv(matched_wide_csv, index=False)
+
+    figure = go.Figure()
+    colors = {
+        "calcium_basic_zero_lag": "#7F7F7F",
+        "calcium_fixed_lag": "#4D4D4D",
+        "suite2p_lag_corrected": "#4C78A8",
+        "cascade_interneuron_lag_corrected": "#F58518",
+    }
+    display_names = {
+        "calcium_basic_zero_lag": "Calcium–voltage\nbasic (zero lag)",
+        "calcium_fixed_lag": "Calcium–voltage\nfixed lag",
+        "suite2p_lag_corrected": "Suite2p\nlag corrected",
+        "cascade_interneuron_lag_corrected": "CASCADE interneuron\nlag corrected",
+    }
+    for method in method_order:
+        values = correlation_values_df.loc[
+            correlation_values_df["method"].astype(str) == method, "pearson_r"
+        ].to_numpy(dtype=float)
+        if values.size == 0:
+            continue
+        figure.add_trace(
+            go.Box(
+                x=[display_names[method]] * int(values.size),
+                y=values,
+                name=display_names[method],
+                boxpoints="all",
+                jitter=0.35,
+                pointpos=0.0,
+                boxmean=True,
+                marker=dict(color=colors[method], size=7, opacity=0.8),
+                line=dict(color=colors[method]),
+                fillcolor=colors[method],
+                opacity=0.55,
+                showlegend=False,
+            )
+        )
+    for _, row in matched_wide_df.iterrows():
+        figure.add_trace(
+            go.Scatter(
+                x=[display_names[method] for method in method_order],
+                y=[row[method] for method in method_order],
+                mode="lines",
+                line=dict(color="rgba(0,0,0,0.16)", width=1),
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+    figure.update_layout(
+        template="simple_white",
+        width=1250,
+        height=720,
+        boxmode="group",
+        title=(
+            "SST model comparison: Suite2p, interneuron CASCADE, and calcium–voltage correlation "
+            f"| calcium fixed lag={fixed_lag_s * 1000.0:.1f} ms ({fixed_lag_source})"
+        ),
+        yaxis_title="Pearson correlation with voltage-derived firing rate",
+        xaxis_title="Method",
+    )
+    figure.update_yaxes(showgrid=True, gridcolor="rgba(0,0,0,0.12)", zeroline=True, zerolinecolor="rgba(0,0,0,0.25)")
+    correlation_html = os.path.join(summary_dir, "sst_model_compare_correlation.html")
+    correlation_svg = os.path.join(summary_dir, "sst_model_compare_correlation.svg") if bool(save_svg) else None
+    figure.write_html(correlation_html)
+    if correlation_svg is not None:
+        try:
+            figure.write_image(correlation_svg)
+        except Exception:
+            correlation_svg = None
+
+    correlation_values_df.attrs["base_model_compare_metrics"] = base_metrics
+    correlation_values_df.attrs["summary_dir"] = summary_dir
+    correlation_values_df.attrs["base_corr_vs_fr_stats_html"] = base_metrics.attrs.get("corr_vs_fr_stats_html", None)
+    correlation_values_df.attrs["base_corr_vs_fr_stats_svg"] = base_metrics.attrs.get("corr_vs_fr_stats_svg", None)
+    correlation_values_df.attrs["correlation_values_csv"] = correlation_values_csv
+    correlation_values_df.attrs["matched_correlation_values_csv"] = matched_wide_csv
+    correlation_values_df.attrs["calcium_lag_selection_csv"] = calcium_lag_selection_csv
+    correlation_values_df.attrs["fixed_lag_csv"] = fixed_lag_csv
+    correlation_values_df.attrs["correlation_html"] = correlation_html
+    correlation_values_df.attrs["correlation_svg"] = correlation_svg
+    correlation_values_df.attrs["calcium_fixed_lag_s"] = fixed_lag_s
+    return correlation_values_df
 
 
 def _spike_count_bin_1_to_6p(n_spikes):
@@ -4636,7 +6802,7 @@ def _shade_color_rgba(base_hex, level_idx, n_levels):
 
 def plot_isolated_event_inferred_spike_distributions(
     loaded_cells,
-    summary_out_dir=r"Z:\Adam-Lab-Shared\Data\Michal_Rubin\data summery\2026\Pyr\model_compare",
+    summary_out_dir=r"Z:\Adam-Lab-Shared\Data\Michal_Rubin\data_summery\2026\Pyr\model_compare",
     include_suite2p=True,
     include_cascade=True,
     cascade_model_name="GC8_EXC_30Hz_smoothing50ms_high_noise",
@@ -4906,7 +7072,7 @@ def plot_isolated_event_inferred_spike_distributions(
 
 def diagnose_cascade_input_quality(
     loaded_cells,
-    summary_out_dir=r"Z:\Adam-Lab-Shared\Data\Michal_Rubin\data summery\2026\Pyr\cascade_vs_realfr\countineous_aproch",
+    summary_out_dir=r"Z:\Adam-Lab-Shared\Data\Michal_Rubin\data_summery\2026\Pyr\cascade_vs_realfr\countineous_aproch",
     cascade_model_name="GC8_EXC_30Hz_smoothing50ms_high_noise",
     pre_window_s=0.25,
     post_window_s=1.0,
@@ -5193,7 +7359,7 @@ def diagnose_cascade_input_quality(
 
 
 def diagnose_cascade_training_dataset_input_quality(
-    summary_out_dir=r"Z:\Adam-Lab-Shared\Data\Michal_Rubin\data summery\2026\Pyr\cascade_vs_realfr\countineous_aproch",
+    summary_out_dir=r"Z:\Adam-Lab-Shared\Data\Michal_Rubin\data_summery\2026\Pyr\cascade_vs_realfr\countineous_aproch",
     cascade_repo_root=None,
     dataset_names=("DS30-GCaMP8f-m-V1", "DS31-GCaMP8m-m-V1", "DS32-GCaMP8s-m-V1"),
     cascade_model_name="GC8_EXC_30Hz_smoothing50ms_high_noise",

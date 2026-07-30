@@ -5571,6 +5571,109 @@ def _event_selection_counts_for_subset(sub_df, cap=SPIKE_COUNT_CAP):
     return labels, sel_vals, nosel_vals
 
 
+def _event_selection_mean_fr_for_subset(sub_df):
+    if sub_df is None or len(sub_df) == 0 or "mean_fr_hz" not in sub_df.columns:
+        return np.nan
+    vals = pd.to_numeric(sub_df["mean_fr_hz"], errors="coerce").to_numpy(dtype=float)
+    vals = vals[np.isfinite(vals)]
+    return float(np.nanmean(vals)) if vals.size else np.nan
+
+
+def _plot_event_selection_selected_pct_vs_mean_fr(df, out_dir):
+    if df is None or len(df) == 0 or "mean_fr_hz" not in df.columns:
+        return []
+    rows = []
+    for cell_folder, sub in df.groupby("cell_folder"):
+        n_total = int(len(sub))
+        if n_total <= 0:
+            continue
+        mean_fr = _event_selection_mean_fr_for_subset(sub)
+        if not np.isfinite(mean_fr):
+            continue
+        n_selected = int(sub["include"].astype(bool).sum())
+        rows.append({
+            "cell_folder": str(cell_folder),
+            "mean_fr_hz": float(mean_fr),
+            "n_events_total": n_total,
+            "n_events_selected": n_selected,
+            "selected_percent": 100.0 * float(n_selected) / float(n_total),
+        })
+    plot_df = pd.DataFrame(rows)
+    if len(plot_df) == 0:
+        return []
+
+    csv_path = os.path.join(out_dir, "cell_by_cell_eventChoss_selected_percent_vs_mean_fr.csv")
+    plot_df.to_csv(csv_path, index=False)
+
+    fig = make_subplots(
+        rows=1,
+        cols=2,
+        subplot_titles=(
+            "Selected events vs mean FR",
+            "Selected event percentage distribution",
+        ),
+        horizontal_spacing=0.16,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=plot_df["mean_fr_hz"],
+            y=plot_df["selected_percent"],
+            mode="markers",
+            marker=dict(size=8, color="#444444", line=dict(color="black", width=0.7)),
+            text=plot_df["cell_folder"],
+            hovertemplate="mean FR=%{x:.3g} Hz<br>selected=%{y:.1f}%<br>%{text}<extra></extra>",
+            showlegend=False,
+        ),
+        row=1,
+        col=1,
+    )
+    x = plot_df["mean_fr_hz"].to_numpy(dtype=float)
+    y = plot_df["selected_percent"].to_numpy(dtype=float)
+    ok = np.isfinite(x) & np.isfinite(y)
+    if np.sum(ok) >= 2 and np.unique(x[ok]).size >= 2:
+        p = np.polyfit(x[ok], y[ok], 1)
+        xs = np.linspace(float(np.nanmin(x[ok])), float(np.nanmax(x[ok])), 100)
+        fig.add_trace(
+            go.Scatter(
+                x=xs,
+                y=np.polyval(p, xs),
+                mode="lines",
+                line=dict(color="#222222", width=2),
+                hoverinfo="skip",
+                showlegend=False,
+            ),
+            row=1,
+            col=1,
+        )
+    fig.add_trace(
+        go.Histogram(
+            x=plot_df["selected_percent"],
+            marker=dict(color="rgba(120,120,120,0.65)", line=dict(color="black", width=0.6)),
+            opacity=0.85,
+            showlegend=False,
+            hovertemplate="selected=%{x:.1f}%<br># cells=%{y}<extra></extra>",
+        ),
+        row=1,
+        col=2,
+    )
+    fig.update_layout(
+        template="simple_white",
+        width=1050,
+        height=520,
+        title="",
+        font=dict(family="Arial"),
+    )
+    fig.update_xaxes(title_text="Mean FR (Hz)", showline=True, linecolor="black", ticks="outside", showgrid=False, row=1, col=1)
+    fig.update_yaxes(title_text="Selected events (%)", showline=True, linecolor="black", ticks="outside", showgrid=False, row=1, col=1)
+    fig.update_xaxes(title_text="Selected events (%)", showline=True, linecolor="black", ticks="outside", showgrid=False, row=1, col=2)
+    fig.update_yaxes(title_text="# cells", showline=True, linecolor="black", ticks="outside", showgrid=False, row=1, col=2)
+    html_path = os.path.join(out_dir, "cell_by_cell_eventChoss_selected_percent_vs_mean_fr.html")
+    svg_path = os.path.join(out_dir, "cell_by_cell_eventChoss_selected_percent_vs_mean_fr.svg")
+    pdf_path = os.path.join(out_dir, "cell_by_cell_eventChoss_selected_percent_vs_mean_fr.pdf")
+    _save_fig_triplet(fig, html_path=html_path, svg_path=svg_path, pdf_path=pdf_path, warn_prefix="EventChoss selected pct vs mean FR")
+    return [csv_path, html_path, svg_path, pdf_path]
+
+
 def _filter_rows_to_overlay_source_per_cell(df):
     """
     Keep only rows from the same per-cell source used by event_spike_overlay_main:
@@ -5729,6 +5832,7 @@ def save_event_selection_cell_by_cell_figures(events_df, out_dir, n_cols=5):
         n_total = int(len(sub))
         n_sel = int(sub["include"].sum()) if n_total > 0 else 0
         n_not = int(n_total - n_sel)
+        mean_fr = _event_selection_mean_fr_for_subset(sub)
         if n_total > 0:
             fig_pie.add_trace(
                 go.Pie(
@@ -5757,6 +5861,24 @@ def save_event_selection_cell_by_cell_figures(events_df, out_dir, n_cols=5):
                 ),
                 row=r, col=c,
             )
+        try:
+            dom = fig_pie.data[-1].domain
+            x_mid = (float(dom.x[0]) + float(dom.x[1])) / 2.0
+            y_txt = max(0.0, float(dom.y[0]) - 0.012)
+            fr_text = f"mean FR={mean_fr:.2f} Hz" if np.isfinite(mean_fr) else "mean FR=n/a"
+            fig_pie.add_annotation(
+                x=x_mid,
+                y=y_txt,
+                xref="paper",
+                yref="paper",
+                text=fr_text,
+                showarrow=False,
+                font=dict(size=10),
+                xanchor="center",
+                yanchor="top",
+            )
+        except Exception:
+            pass
     fig_pie.update_layout(
         template="simple_white",
         width=max(1500, 340 * n_cols),
@@ -5769,6 +5891,7 @@ def save_event_selection_cell_by_cell_figures(events_df, out_dir, n_cols=5):
     pie_pdf = os.path.join(out_dir, "cell_by_cell_eventChoss_pie.pdf")
     _save_fig_triplet(fig_pie, html_path=pie_html, svg_path=pie_svg, pdf_path=pie_pdf, warn_prefix="EventChoss cell-by-cell")
     saved.extend([pie_html, pie_svg, pie_pdf])
+    saved.extend(_plot_event_selection_selected_pct_vs_mean_fr(df, out_dir))
 
     fig_bar = make_subplots(
         rows=n_rows,
@@ -5893,7 +6016,7 @@ def save_event_selection_population_figures(events_df, out_dir):
 # Run on all PyrLowFR cells
 # -------------------------------
 DB_PATH = r"Z:\Adam-Lab-Shared\Data\Michal_Rubin\Dendrites\PyrLowFR.csv"
-POP_SUMMARY_OUT_DIR = r"Z:\Adam-Lab-Shared\Data\Michal_Rubin\data summery\2026\Pyr\calciumRes"
+POP_SUMMARY_OUT_DIR = r"Z:\Adam-Lab-Shared\Data\Michal_Rubin\data_summery\2026\Pyr\calciumRes"
 SUMMARY_HTML = os.path.join(POP_SUMMARY_OUT_DIR, "PyrLowFR_event_metrics_summary.html")
 SUMMARY_SVG = os.path.join(POP_SUMMARY_OUT_DIR, "PyrLowFR_event_metrics_summary.svg")
 SUMMARY_CSV = os.path.join(POP_SUMMARY_OUT_DIR, "PyrLowFR_event_metrics_all_events.csv")
